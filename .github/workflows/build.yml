@@ -4,10 +4,16 @@
 # Triggers:
 #   push to main     → always build + push (Containerfile/entrypoint changes)
 #   pull_request     → build only (no push), posts result as check
-#   schedule (2 AM)  → checks upstream OpenClaw for new release nightly; builds only
-#                       if the version label on :latest has changed
-#   workflow_dispatch → manual trigger; optional force_rebuild flag and
-#                       openclaw_ref override (branch/tag/SHA)
+#   schedule (2 AM)  → nightly rebuild, unconditionally
+#   workflow_dispatch → manual trigger; optional openclaw_ref override
+#
+# Why nightly rebuilds are unconditional:
+#   The build used to skip when upstream OpenClaw had not cut a new release.
+#   That optimises for the wrong thing. UBI 10 and Project Hummingbird ship
+#   patched RPMs continuously, and an image only picks them up when it is
+#   rebuilt — so tying rebuilds to upstream releases left images sitting weeks
+#   behind on base-image CVEs (observed: 13 days stale, 9 Critical on the UBI
+#   variant). A 12-minute nightly build is cheaper than that exposure.
 #
 # Secrets required (Settings → Secrets → Actions):
 #   QUAY_USERNAME   — your Quay.io username (ryan_nix)
@@ -16,7 +22,10 @@
 # Tag strategy:
 #   :latest               — main branch and scheduled builds
 #   :YYYY.MM.DD           — every successful push/schedule build
-#   :git-<short-sha>      — every build (immutable reference)
+#   :git-<short-sha>      — every build
+#                           NOTE: no longer immutable. With nightly rebuilds the
+#                           same repo SHA maps to many digests over time. Use
+#                           the digest for a truly pinned reference.
 #   :openclaw-<version>   — tagged with upstream OpenClaw release when known
 # =============================================================================
 
@@ -42,11 +51,6 @@ on:
     - cron: "0 2 * * *"   # 02:00 UTC nightly
   workflow_dispatch:
     inputs:
-      force_rebuild:
-        description: "Force rebuild even if upstream OpenClaw is unchanged"
-        required: false
-        type: boolean
-        default: false
       openclaw_ref:
         # Must default to empty, NOT "main". GitHub populates inputs.* with the
         # declared default on every workflow_dispatch, so a non-empty default
@@ -78,19 +82,21 @@ concurrency:
 jobs:
 
   # =========================================================================
-  # JOB 1 — Upstream version check
+  # JOB 1 — Resolve upstream release tag
   #
-  # Fetches the latest OpenClaw GitHub release and compares its tag against
-  # the org.opencontainers.image.version label on the current :latest image
-  # in Quay. Used only by the nightly schedule to avoid unnecessary rebuilds.
-  # All other triggers skip straight to build.
+  # Fetches the latest OpenClaw GitHub release tag, which the build job uses
+  # as the ref to clone. Also reads the version label currently on :latest in
+  # Quay, purely so the log records whether this rebuild carries a new upstream
+  # version or is a base-image refresh of the same one.
+  #
+  # This job no longer gates the build. See the header note on why nightly
+  # rebuilds are unconditional.
   # =========================================================================
   upstream:
     name: Check upstream version
     runs-on: ubuntu-latest
     outputs:
       openclaw_version: ${{ steps.openclaw.outputs.version }}
-      should_build:     ${{ steps.decision.outputs.should_build }}
 
     steps:
       - name: Fetch latest OpenClaw release tag
@@ -119,30 +125,21 @@ jobs:
           fi
           echo "current=${CURRENT}" | tee -a "${GITHUB_OUTPUT}"
 
-      - name: Decide whether to build
-        id: decision
+      - name: Report what this run will do
         env:
           TRIGGER:   ${{ github.event_name }}
-          FORCE:     ${{ inputs.force_rebuild }}
           UPSTREAM:  ${{ steps.openclaw.outputs.version }}
           CURRENT:   ${{ steps.quay.outputs.current }}
         run: |
-          if [[ "${TRIGGER}" != "schedule" ]]; then
-            echo "Trigger is '${TRIGGER}' — building unconditionally."
-            echo "should_build=true" >> "${GITHUB_OUTPUT}"
-
-          elif [[ "${FORCE}" == "true" ]]; then
-            echo "Force rebuild requested."
-            echo "should_build=true" >> "${GITHUB_OUTPUT}"
-
-          elif [[ "${UPSTREAM}" != "${CURRENT}" ]]; then
+          # Informational only — every trigger builds. This exists so the run
+          # log answers "did upstream move, or is this a CVE refresh?" without
+          # anyone having to diff labels by hand.
+          if [[ "${UPSTREAM}" != "${CURRENT}" ]]; then
             echo "OpenClaw version changed: ${CURRENT} → ${UPSTREAM}"
-            echo "should_build=true" >> "${GITHUB_OUTPUT}"
-
           else
-            echo "Upstream OpenClaw is still ${CURRENT}. No rebuild needed."
-            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            echo "OpenClaw unchanged at ${CURRENT} — rebuilding for base image patches."
           fi
+          echo "Trigger: ${TRIGGER}"
 
   # =========================================================================
   # JOB 2 — Build (and push on non-PR runs)
@@ -158,7 +155,6 @@ jobs:
     name: "${{ matrix.variant.name }} — Build${{ github.event_name != 'pull_request' && ' & Push' || ' (PR check)' }}"
     runs-on: ubuntu-latest
     needs: upstream
-    if: needs.upstream.outputs.should_build == 'true'
     strategy:
       fail-fast: false   # build both variants even if one fails
       matrix:
@@ -247,7 +243,7 @@ jobs:
 
           # Log the ref this build will actually clone. Without it, the resolved
           # value stays invisible until buildah's env dump — which is where a
-          # silent fallback to tip-of-main went unnoticed for weeks.
+          # silent fallback to tip-of-main went unnoticed.
           echo "Building OpenClaw ref: ${OC_REF}"
 
           # Step summary
