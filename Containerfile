@@ -3,8 +3,12 @@
 # Maintainer: Ryan Nix <ryan.nix@gmail.com>
 #
 # Two-stage build:
-#   builder  — UBI 10 Node 24 + pnpm + full source build
-#   runtime  — UBI 10 Node 24 with compiled dist only
+#   builder  — UBI 10 Node 22 + pnpm + full source build
+#   runtime  — UBI 10 Node 22 with compiled dist only
+#
+# Both stages MUST use the same Node major version. Node 24 in the runtime
+# stage causes a protocol disagreement between the Control UI and the gateway
+# (same issue documented in hummingbird/Containerfile).
 #
 # OpenShift compatibility:
 #   - Runs as UID 1001, GID 0 (arbitrary UID support for restricted SCC)
@@ -43,11 +47,10 @@ RUN dnf install -y \
 # NOTE: pnpm install requires ~2 GB RAM; ensure your build host/runner has it
 RUN npm install -g pnpm@latest
 
-# Clone latest stable OpenClaw release
-# Pin to a specific tag in production: --branch 2026.x.x
-# Clone a specific release tag (passed by CI) instead of HEAD.
-# HEAD of main moves daily and can be mid-development between releases,
-# causing protocol mismatches between the UI and gateway.
+# Clone a specific release tag (passed by CI as --build-arg OPENCLAW_REF)
+# instead of HEAD. HEAD of main moves daily and can be mid-development between
+# releases, causing protocol mismatches between the UI and gateway — and
+# occasional outright build breakage in upstream's own build scripts.
 ARG OPENCLAW_REF=main
 RUN git clone --depth 1 --branch "${OPENCLAW_REF}"     https://github.com/openclaw/openclaw.git .
 
@@ -122,8 +125,11 @@ RUN rm -rf .git .github .gitignore .gitattributes \
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
+#
+# Node 22 to match the builder stage. Do not bump to 24 without also bumping
+# the builder — a version skew between the two breaks the UI/gateway protocol.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi10/nodejs-24:latest AS runtime
+FROM registry.access.redhat.com/ubi10/nodejs-22:latest AS runtime
 
 LABEL name="openclaw-openshift" \
       maintainer="Ryan Nix <ryan.nix@gmail.com>" \

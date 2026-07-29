@@ -48,9 +48,14 @@ on:
         type: boolean
         default: false
       openclaw_ref:
-        description: "OpenClaw git ref to build (branch / tag / SHA). Default: main"
+        # Must default to empty, NOT "main". GitHub populates inputs.* with the
+        # declared default on every workflow_dispatch, so a non-empty default
+        # makes the `inputs.openclaw_ref || ...openclaw_version` fallback in the
+        # meta step short-circuit immediately — the resolved release tag is
+        # never reached and the build silently clones tip-of-main instead.
+        description: "OpenClaw git ref to build (branch / tag / SHA). Blank = latest release tag."
         required: false
-        default: "main"
+        default: ""
 
 permissions:
   contents: read
@@ -143,8 +148,8 @@ jobs:
   # JOB 2 — Build (and push on non-PR runs)
   #
   # Matrix strategy builds both variants in parallel:
-  #   ubi10       — registry.access.redhat.com/ubi10/nodejs-24 (shell entrypoint)
-  #   hummingbird — registry.access.redhat.com/hi/nodejs:24.15.0 (distroless, JS entrypoint)
+  #   ubi10       — registry.access.redhat.com/ubi10/nodejs-22 (shell entrypoint)
+  #   hummingbird — registry.access.redhat.com/hi/nodejs:22 (distroless, JS entrypoint)
   #
   # Tag prefix:   ubi10 → :latest / :2026.05.07 / :git-<sha>
   #               hummingbird → :hummingbird-latest / :hummingbird-2026.05.07 etc.
@@ -165,7 +170,7 @@ jobs:
           - name: hummingbird
             containerfile: ./hummingbird/Containerfile
             tag_prefix: "hummingbird-"
-            label_base: "Project Hummingbird (distroless)"  
+            label_base: "Project Hummingbird (distroless)"
 
     steps:
       - name: Checkout
@@ -240,33 +245,32 @@ jobs:
             echo "oc_ref=${OC_REF}"
           } >> "${GITHUB_OUTPUT}"
 
+          # Log the ref this build will actually clone. Without it, the resolved
+          # value stays invisible until buildah's env dump — which is where a
+          # silent fallback to tip-of-main went unnoticed for weeks.
+          echo "Building OpenClaw ref: ${OC_REF}"
+
           # Step summary
           {
             echo "### Image tags"
-            echo ''''''
+            echo '```'
             echo "${BASE}:${PREFIX}${DATE}"
             echo "${BASE}:${PREFIX}git-${SHORT_SHA}"
             [[ "${PUSH_LATEST}"     == "true" ]] && echo "${BASE}:${PREFIX}latest"
             [[ "${PUSH_OC_VERSION}" == "true" ]] && echo "${BASE}:${PREFIX}openclaw-${OC_VERSION}"
-            echo ''''''
+            echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
-
-      # -----------------------------------------------------------------------
-      # Patch the Containerfile to pin to the specific OpenClaw ref when a
-      # non-default ref is supplied via workflow_dispatch. This allows building
-      # a specific upstream release without modifying the committed Containerfile.
-      # -----------------------------------------------------------------------
-      - name: Pin OpenClaw ref in Containerfile
-        if: inputs.openclaw_ref != '' && inputs.openclaw_ref != 'main'
-        run: |
-          REF="${{ steps.meta.outputs.oc_ref }}"
-          echo "Pinning OpenClaw clone to ref: ${REF}"
-          sed -i "s|git clone --depth 1 https://github.com/openclaw/openclaw.git|git clone --depth 1 --branch ${REF} https://github.com/openclaw/openclaw.git|g" Containerfile
 
       # -----------------------------------------------------------------------
       # Build via Buildah (multi-stage, linux/amd64).
       # The pnpm build step in Stage 1 uses ~1.8 GB RAM; ubuntu-latest runners
       # have 7 GB, so no custom runner is needed.
+      #
+      # OPENCLAW_REF is passed as a build-arg and consumed by the ARG in each
+      # Containerfile's clone stage. Both Containerfiles already use
+      # `git clone --depth 1 --branch "${OPENCLAW_REF}"`, so no file patching
+      # is required — an earlier sed-based "pin" step was dead code (its
+      # pattern could not match either file) and has been removed.
       # -----------------------------------------------------------------------
       - name: Build image with Buildah
         id: build
@@ -276,12 +280,12 @@ jobs:
           tags:           ${{ steps.meta.outputs.tags }}
           containerfiles: ${{ matrix.variant.containerfile }}
           platforms:      linux/amd64
+          build-args: |
+            OPENCLAW_REF=${{ steps.meta.outputs.oc_ref }}
           # Stream all RUN command stdout/stderr to the Actions log.
           # Without this, buildah only prints the failing step number and exit
           # code — the actual error (e.g. pnpm ERR_PNPM_OUTDATED_LOCKFILE)
           # is swallowed and you see nothing useful.
-          build-args: |
-            OPENCLAW_REF=${{ steps.meta.outputs.oc_ref }}
           extra-args: --log-level=debug
           labels: |
             org.opencontainers.image.title=OpenClaw on OpenShift
@@ -313,58 +317,6 @@ jobs:
           password: ${{ secrets.QUAY_PASSWORD }}
 
       # -----------------------------------------------------------------------
-      # SBOM generation — syft produces a Software Bill of Materials in both
-      # SPDX and CycloneDX formats for each pushed image. Clair (on Quay)
-      # already SCANS images for CVEs; this step INVENTORIES them — a durable,
-      # attestable manifest of every package in the image, tied to the exact
-      # digest. Regulated customers (FSI, healthcare) require the SBOM as an
-      # audit artifact, separate from the point-in-time vulnerability scan.
-      #
-      # Runs per-variant, so ubi10 and hummingbird each get their own SBOMs.
-      # Skipped on PRs (no pushed image to inventory).
-      # -----------------------------------------------------------------------
-      - name: Install syft
-        if: github.event_name != 'pull_request'
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b /usr/local/bin
-
-      - name: Generate SBOMs (SPDX + CycloneDX)
-        id: sbom
-        if: github.event_name != 'pull_request'
-        run: |
-          IMAGE_DIGEST="${{ env.IMAGE_REF }}@${{ steps.push.outputs.digest }}"
-          PREFIX="${{ matrix.variant.tag_prefix }}"
-          OUT="sbom"
-          mkdir -p "${OUT}"
-
-          echo "Generating SBOMs for ${IMAGE_DIGEST}"
-
-          # SPDX (ISO/IEC 5962 standard — broad tooling + procurement acceptance)
-          syft "${IMAGE_DIGEST}" -o spdx-json \
-            > "${OUT}/${PREFIX}openclaw-sbom.spdx.json"
-
-          # CycloneDX (OWASP standard — security/vulnerability tooling native)
-          syft "${IMAGE_DIGEST}" -o cyclonedx-json \
-            > "${OUT}/${PREFIX}openclaw-sbom.cyclonedx.json"
-
-          # Human-readable table for quick eyeballing in the artifact
-          syft "${IMAGE_DIGEST}" -o table \
-            > "${OUT}/${PREFIX}openclaw-sbom.txt"
-
-          echo "sbom_dir=${OUT}" >> "${GITHUB_OUTPUT}"
-          echo "Generated:"
-          ls -lh "${OUT}"
-
-      - name: Upload SBOM artifacts
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom-${{ matrix.variant.name }}
-          path: ${{ steps.sbom.outputs.sbom_dir }}/
-          retention-days: 90
-
-      # -----------------------------------------------------------------------
       # Job summary — printed in the Actions run page for quick reference.
       # -----------------------------------------------------------------------
       - name: Write job summary
@@ -377,13 +329,13 @@ jobs:
           echo "|---|---|" >> "${GITHUB_STEP_SUMMARY}"
           echo "| Trigger | ${EVENT} |" >> "${GITHUB_STEP_SUMMARY}"
           echo "| OpenClaw version | ${{ steps.meta.outputs.oc_version }} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| OpenClaw ref built | \`${{ steps.meta.outputs.oc_ref }}\` |" >> "${GITHUB_STEP_SUMMARY}"
           echo "| Git SHA | \`${{ steps.meta.outputs.short_sha }}\` |" >> "${GITHUB_STEP_SUMMARY}"
           echo "| Build date | ${{ steps.meta.outputs.date }} |" >> "${GITHUB_STEP_SUMMARY}"
 
           if [[ "${EVENT}" != "pull_request" ]]; then
             echo "| Pushed | ✅ Yes |" >> "${GITHUB_STEP_SUMMARY}"
             echo "| Digest | \`${{ steps.push.outputs.digest }}\` |" >> "${GITHUB_STEP_SUMMARY}"
-            echo "| SBOM | 📋 SPDX + CycloneDX (see \`sbom-${{ matrix.variant.name }}\` artifact) |" >> "${GITHUB_STEP_SUMMARY}"
             echo "" >> "${GITHUB_STEP_SUMMARY}"
             echo "**Image:** [\`${{ env.IMAGE_REF }}:latest\`](https://quay.io/repository/ryan_nix/openclaw-openshift)" >> "${GITHUB_STEP_SUMMARY}"
           else
