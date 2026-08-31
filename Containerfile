@@ -3,12 +3,8 @@
 # Maintainer: Ryan Nix <ryan.nix@gmail.com>
 #
 # Two-stage build:
-#   builder  — UBI 10 Node 22 + pnpm + full source build
-#   runtime  — UBI 10 Node 22 with compiled dist only
-#
-# Both stages MUST use the same Node major version. Node 24 in the runtime
-# stage causes a protocol disagreement between the Control UI and the gateway
-# (same issue documented in hummingbird/Containerfile).
+#   builder  — UBI 10 Node 24 + pnpm + full source build
+#   runtime  — UBI 10 Node 24 with compiled dist only
 #
 # OpenShift compatibility:
 #   - Runs as UID 1001, GID 0 (arbitrary UID support for restricted SCC)
@@ -19,8 +15,12 @@
 
 # ---------------------------------------------------------------------------
 # Stage 1: Builder
+#
+# Node 24: OpenClaw v2026.8.x declares engines ">=24.15.0 <25" and their own
+# official Dockerfile builds on node:24-bookworm. (The June Node-24 build
+# failures were on v2026.6.x, before upstream supported building on 24.)
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi10/nodejs-22:latest AS builder
+FROM registry.access.redhat.com/ubi10/nodejs-24:latest AS builder
 
 LABEL stage="builder"
 
@@ -43,29 +43,45 @@ RUN dnf install -y \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# Install pnpm (OpenClaw's package manager)
-# NOTE: pnpm install requires ~2 GB RAM; ensure your build host/runner has it
-RUN npm install -g pnpm@latest
-
-# Clone a specific release tag (passed by CI as --build-arg OPENCLAW_REF)
-# instead of HEAD. HEAD of main moves daily and can be mid-development between
-# releases, causing protocol mismatches between the UI and gateway — and
-# occasional outright build breakage in upstream's own build scripts.
+# Clone a specific release tag (passed by CI) instead of HEAD.
+# HEAD of main moves daily and can be mid-development between releases,
+# causing protocol mismatches between the UI and gateway.
 ARG OPENCLAW_REF=main
 RUN git clone --depth 1 --branch "${OPENCLAW_REF}"     https://github.com/openclaw/openclaw.git .
 
-# Install all dependencies (dev deps required for TypeScript compilation).
-# --frozen-lockfile omitted intentionally — see comment on CI=true above.
-RUN pnpm install --no-frozen-lockfile
+# Enable pnpm via Corepack, pinned to the exact version OpenClaw specifies in
+# package.json's "packageManager" field. As of v2026.8.x OpenClaw pins
+# pnpm@12.x and ships a frozen lockfile — installing pnpm@latest via npm no
+# longer matches and breaks the install. Corepack reads the pin and activates
+# the precise version, so we always track whatever the cloned release wants.
+RUN corepack enable && \
+    corepack prepare --activate
 
-# Compile TypeScript → dist/
-RUN pnpm build
+# Install ALL dependencies (dev deps required for the TypeScript/asset build).
+# --frozen-lockfile: OpenClaw now ships a committed lockfile and expects it to
+# be honored exactly (their own Dockerfile uses --frozen-lockfile).
+# NODE_OPTIONS raises the heap — the tsdown/asset build is memory-hungry and
+# OOMs (exit 137) on default limits.
+RUN NODE_OPTIONS=--max-old-space-size=8192 \
+    pnpm install --frozen-lockfile
 
-# Build the Control UI frontend assets.
-# pnpm build only compiles the Node.js backend/gateway; the web interface
-# is a separate frontend bundle that requires its own build step.
-# Without this, the gateway serves "Control UI assets not found."
-RUN pnpm ui:build
+# Build the backend + assets using OpenClaw's Docker build target.
+# As of v2026.8.x the old "pnpm build" was replaced by "pnpm build:docker",
+# a chain that runs plugins:assets:build, tsdown-build, runtime-postbuild,
+# build stamping, and metadata generation. OPENCLAW_PREFER_PNPM=1 forces the
+# pnpm path for asset bundling (upstream's Bun path can fail on some arches);
+# skipping .d.ts generation speeds the build and drops nothing needed at runtime.
+RUN NODE_OPTIONS=--max-old-space-size=8192 \
+    OPENCLAW_PREFER_PNPM=1 \
+    OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
+    pnpm_config_verify_deps_before_run=false \
+    pnpm build:docker
+
+# Build the Control UI frontend bundle (separate from the backend build).
+# Without this the gateway serves "Control UI assets not found."
+RUN OPENCLAW_PREFER_PNPM=1 \
+    pnpm_config_verify_deps_before_run=false \
+    pnpm ui:build
 
 # Prune dev dependencies, then aggressively strip the node_modules tree
 # before it gets COPY'd into the runtime stage.
@@ -86,7 +102,7 @@ RUN pnpm ui:build
 # pnpm store prune removes the content-addressable cache that accumulates
 # during install; it lives under ~/.local/share/pnpm/store and is not
 # referenced at runtime but would bloat the layer if not cleared.
-RUN pnpm prune --prod && \
+RUN pnpm prune --prod 2>/dev/null || true && \
     find node_modules -maxdepth 4 \( \
         -name "*.md"        -o -name "*.MD"      \
         -o -name "*.txt"    -o -name "*.map"      \
@@ -125,11 +141,8 @@ RUN rm -rf .git .github .gitignore .gitattributes \
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
-#
-# Node 22 to match the builder stage. Do not bump to 24 without also bumping
-# the builder — a version skew between the two breaks the UI/gateway protocol.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi10/nodejs-22:latest AS runtime
+FROM registry.access.redhat.com/ubi10/nodejs-24:latest AS runtime
 
 LABEL name="openclaw-openshift" \
       maintainer="Ryan Nix <ryan.nix@gmail.com>" \

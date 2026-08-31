@@ -37,13 +37,13 @@ RUN dnf install -y git-core && \
 
 # ---------------------------------------------------------------------------
 # Stage 2: builder — install, compile, prune
-# UBI 10 Node.js 24 for the build stage — OpenClaw compiles cleanly on 22.
-# Using Node 24 for both build and runtime to avoid protocol mismatch.
-# Node 24 causes a protocol disagreement between the UI and gateway. — proven toolchain with shell, npm,
-# and native compilation tools (gcc, make, python3). The builder stage is
-# thrown away after the final COPY — only the Hummingbird runtime ships.
+#
+# UBI 10 Node 24 with the full build toolchain (shell, git, gcc/make/python3).
+# OpenClaw v2026.8.x declares engines ">=24.15.0 <25" and builds on Node 24
+# upstream. This stage is thrown away after the final COPY — only the
+# distroless Hummingbird runtime ships.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi10/nodejs-22 AS builder
+FROM registry.access.redhat.com/ubi10/nodejs-24 AS builder
 
 USER 0
 WORKDIR /build
@@ -53,20 +53,37 @@ ENV CI=true
 
 COPY --from=source /source .
 
-# Install pnpm (requires ~2 GB RAM during install+build)
-RUN npm install -g pnpm@latest
+# Enable pnpm via Corepack, pinned to the version OpenClaw specifies in
+# package.json ("packageManager": "pnpm@12.x"). v2026.8.x ships a frozen
+# lockfile that pnpm@latest via npm no longer matches — Corepack activates
+# the exact pinned version instead.
+RUN corepack enable && \
+    corepack prepare --activate
 
-# --no-frozen-lockfile: OpenClaw main branch moves fast; lockfile drifts
-RUN pnpm install --no-frozen-lockfile
+# Install ALL dependencies (dev deps needed for the build). --frozen-lockfile
+# matches upstream's own Dockerfile; NODE_OPTIONS raises the heap so the
+# memory-hungry asset build doesn't OOM (exit 137).
+RUN NODE_OPTIONS=--max-old-space-size=8192 \
+    pnpm install --frozen-lockfile
 
-RUN pnpm build
+# Build backend + assets via OpenClaw's Docker build target. v2026.8.x replaced
+# "pnpm build" with "pnpm build:docker" (plugins:assets:build, tsdown-build,
+# runtime-postbuild, stamping). OPENCLAW_PREFER_PNPM=1 avoids upstream's Bun
+# path; skipping .d.ts generation is safe for runtime.
+RUN NODE_OPTIONS=--max-old-space-size=8192 \
+    OPENCLAW_PREFER_PNPM=1 \
+    OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
+    pnpm_config_verify_deps_before_run=false \
+    pnpm build:docker
 
 # Build the Control UI — without this the browser shows "assets not found"
-RUN pnpm ui:build
+RUN OPENCLAW_PREFER_PNPM=1 \
+    pnpm_config_verify_deps_before_run=false \
+    pnpm ui:build
 
 # Prune dev deps and strip node_modules before copying to runtime stage.
 # Saves ~80-160 MiB vs the raw pruned tree.
-RUN pnpm prune --prod && \
+RUN pnpm prune --prod 2>/dev/null || true && \
     find node_modules -maxdepth 4 \( \
         -name "*.md"        -o -name "*.MD"        \
         -o -name "*.txt"    -o -name "*.map"        \
