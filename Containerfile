@@ -49,13 +49,16 @@ RUN dnf install -y \
 ARG OPENCLAW_REF=main
 RUN git clone --depth 1 --branch "${OPENCLAW_REF}"     https://github.com/openclaw/openclaw.git .
 
-# Enable pnpm via Corepack, pinned to the exact version OpenClaw specifies in
-# package.json's "packageManager" field. As of v2026.8.x OpenClaw pins
-# pnpm@12.x and ships a frozen lockfile — installing pnpm@latest via npm no
-# longer matches and breaks the install. Corepack reads the pin and activates
-# the precise version, so we always track whatever the cloned release wants.
-RUN corepack enable && \
-    corepack prepare --activate
+# Activate pnpm at the version OpenClaw pins in package.json's "packageManager"
+# field (v2026.8.x pins pnpm@12.x with a SHA-512 hash). UBI's bundled corepack
+# may be absent or too old to parse hashed pins, so install a current corepack
+# from npm first, then let it read and activate the exact pinned version.
+# Falls back to enabling corepack's shims; the first pnpm call auto-provisions.
+RUN npm install -g corepack@latest && \
+    corepack enable && \
+    PM="$(node -p "require('./package.json').packageManager" 2>/dev/null || echo '')" && \
+    if [ -n "$PM" ]; then corepack prepare "$PM" --activate; else corepack prepare --activate; fi && \
+    pnpm --version
 
 # Install ALL dependencies (dev deps required for the TypeScript/asset build).
 # --frozen-lockfile: OpenClaw now ships a committed lockfile and expects it to

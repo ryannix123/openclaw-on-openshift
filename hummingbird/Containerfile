@@ -53,12 +53,15 @@ ENV CI=true
 
 COPY --from=source /source .
 
-# Enable pnpm via Corepack, pinned to the version OpenClaw specifies in
-# package.json ("packageManager": "pnpm@12.x"). v2026.8.x ships a frozen
-# lockfile that pnpm@latest via npm no longer matches — Corepack activates
-# the exact pinned version instead.
-RUN corepack enable && \
-    corepack prepare --activate
+# Activate pnpm at the version OpenClaw pins in package.json ("packageManager":
+# "pnpm@12.x"). UBI's bundled corepack may be absent or too old to parse the
+# hashed pin, so install a current corepack from npm first, then activate the
+# exact pinned version.
+RUN npm install -g corepack@latest && \
+    corepack enable && \
+    PM="$(node -p "require('./package.json').packageManager" 2>/dev/null || echo '')" && \
+    if [ -n "$PM" ]; then corepack prepare "$PM" --activate; else corepack prepare --activate; fi && \
+    pnpm --version
 
 # Install ALL dependencies (dev deps needed for the build). --frozen-lockfile
 # matches upstream's own Dockerfile; NODE_OPTIONS raises the heap so the
