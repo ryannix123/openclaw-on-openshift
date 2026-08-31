@@ -73,7 +73,14 @@ RUN NODE_OPTIONS=--max-old-space-size=8192 \
 # "pnpm build" with "pnpm build:docker" (plugins:assets:build, tsdown-build,
 # runtime-postbuild, stamping). OPENCLAW_PREFER_PNPM=1 avoids upstream's Bun
 # path; skipping .d.ts generation is safe for runtime.
-RUN NODE_OPTIONS=--max-old-space-size=8192 \
+#
+# OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB is REQUIRED under buildah/podman: the build
+# runs rootless where the process can't read its cgroup memory limit, so
+# OpenClaw's tsdown wrapper aborts unless given an explicit heap. 6144 MB stays
+# under GitHub's ~7 GB runner ceiling.
+RUN NODE_OPTIONS=--max-old-space-size=6144 \
+    OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB=6144 \
+    OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=6144 \
     OPENCLAW_PREFER_PNPM=1 \
     OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
     pnpm_config_verify_deps_before_run=false \

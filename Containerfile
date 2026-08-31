@@ -74,7 +74,17 @@ RUN NODE_OPTIONS=--max-old-space-size=8192 \
 # build stamping, and metadata generation. OPENCLAW_PREFER_PNPM=1 forces the
 # pnpm path for asset bundling (upstream's Bun path can fail on some arches);
 # skipping .d.ts generation speeds the build and drops nothing needed at runtime.
-RUN NODE_OPTIONS=--max-old-space-size=8192 \
+#
+# OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB is REQUIRED under buildah/podman: the build
+# runs in a rootless namespace where the process can't read its own cgroup
+# memory limit, so OpenClaw's tsdown wrapper refuses to guess a heap size and
+# aborts ("process memory limit is not visible through this cgroup mount
+# namespace"). Setting it explicitly (and its DOCKER_BUILD_ alias) satisfies
+# that guardrail. 6144 MB stays safely under GitHub's ~7 GB runner ceiling —
+# 8192 would risk an OOM kill on the runner itself.
+RUN NODE_OPTIONS=--max-old-space-size=6144 \
+    OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB=6144 \
+    OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=6144 \
     OPENCLAW_PREFER_PNPM=1 \
     OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
     pnpm_config_verify_deps_before_run=false \
