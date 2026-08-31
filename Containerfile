@@ -16,11 +16,18 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder
 #
-# Node 24: OpenClaw v2026.8.x declares engines ">=24.15.0 <25" and their own
-# official Dockerfile builds on node:24-bookworm. (The June Node-24 build
-# failures were on v2026.6.x, before upstream supported building on 24.)
+# Base: ubi10/ubi (RHEL 10 userland) + the OFFICIAL Node.js 24 binary from
+# nodejs.org — NOT Red Hat's ubi10/nodejs-24 image.
+#
+# Why: OpenClaw 2.0 (v2026.8.x) requires WAL-reset-safe SQLite (>=3.50.7).
+# Red Hat's nodejs-24 build dynamically links the SYSTEM libsqlite3, and RHEL
+# 10 ships SQLite 3.46.1 (affected by the WAL-reset corruption bug) and — per
+# Red Hat policy — will never rebase it. OpenClaw's build guard hard-fails on
+# it. The official Node.js binary STATICALLY BUNDLES SQLite 3.53.4, which is
+# safe, so we use upstream Node on a UBI base. This keeps the RHEL 10 userland
+# (and the Red Hat supply-chain / CVE story) while satisfying the SQLite gate.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi10/nodejs-24:latest AS builder
+FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 
 LABEL stage="builder"
 
@@ -28,20 +35,43 @@ USER root
 WORKDIR /build
 
 # pnpm requires CI=true to run non-interactively in a container (no TTY).
-# The GitHub Actions runner sets this in its own env, but buildah containers
-# start with a clean UBI environment — so we set it explicitly here.
 ENV CI=true
 
-# Install build toolchain needed for native node module compilation
-# python3/make/gcc are required by some transitive pnpm dependencies
+# Install build toolchain (git for clone; gcc/make/python3 for native modules).
+# xz is needed to unpack the Node.js .tar.xz tarball.
 RUN dnf install -y \
       git \
       python3 \
       make \
       gcc \
-      gcc-c++ && \
+      gcc-c++ \
+      tar \
+      xz \
+      findutils && \
     dnf clean all && \
     rm -rf /var/cache/dnf
+
+# Install the official Node.js 24 LTS binary from nodejs.org.
+# This build statically bundles SQLite 3.53.4 (WAL-reset-safe), unlike
+# Red Hat's nodejs-24 which links the unsafe system libsqlite3.
+# Pinned to a specific version for reproducible builds; bump deliberately.
+ARG NODE_VERSION=24.20.0
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  node_arch="x64" ;; \
+      aarch64) node_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+      -o /tmp/node.tar.xz; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+      --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
+    rm -f /tmp/node.tar.xz; \
+    node --version; \
+    npm --version; \
+    # Sanity-check that this Node's bundled SQLite is the safe one.
+    node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(':memory:'); const v=db.prepare('select sqlite_version() as v').get().v; console.log('bundled sqlite',v); db.close();"
 
 # Clone a specific release tag (passed by CI) instead of HEAD.
 # HEAD of main moves daily and can be mid-development between releases,
@@ -50,9 +80,8 @@ ARG OPENCLAW_REF=main
 RUN git clone --depth 1 --branch "${OPENCLAW_REF}"     https://github.com/openclaw/openclaw.git .
 
 # Activate pnpm at the version OpenClaw pins in package.json's "packageManager"
-# field (v2026.8.x pins pnpm@12.x with a SHA-512 hash). UBI's bundled corepack
-# may be absent or too old to parse hashed pins, so install a current corepack
-# from npm first, then let it read and activate the exact pinned version.
+# field (v2026.8.x pins pnpm@12.x with a SHA-512 hash). The official Node
+# binary ships a modern corepack, so enable it and activate the pinned version.
 # Falls back to enabling corepack's shims; the first pnpm call auto-provisions.
 RUN npm install -g corepack@latest && \
     corepack enable && \
@@ -154,8 +183,13 @@ RUN rm -rf .git .github .gitignore .gitattributes \
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
+#
+# Same base strategy as the builder: ubi10/ubi + official Node.js 24.
+# OpenClaw uses SQLite at RUNTIME (sessions, transcripts, memory in 2.0), so
+# the runtime Node must also bundle WAL-reset-safe SQLite 3.53.4. Red Hat's
+# nodejs-24 (unsafe system 3.46.1) would fail the same guard at gateway start.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi10/nodejs-24:latest AS runtime
+FROM registry.access.redhat.com/ubi10/ubi:latest AS runtime
 
 LABEL name="openclaw-openshift" \
       maintainer="Ryan Nix <ryan.nix@gmail.com>" \
@@ -166,6 +200,27 @@ LABEL name="openclaw-openshift" \
       io.openshift.tags="ai,agent,nodejs,ubi10"
 
 USER root
+
+# Runtime needs the official Node.js 24 (bundled safe SQLite) plus a few
+# runtime utilities. tar/xz to unpack Node; git because OpenClaw shells out to
+# it for some workspace operations; shadow-utils for user management.
+ARG NODE_VERSION=24.20.0
+RUN dnf install -y tar xz git shadow-utils && \
+    dnf clean all && rm -rf /var/cache/dnf && \
+    set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  node_arch="x64" ;; \
+      aarch64) node_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+      -o /tmp/node.tar.xz; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+      --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
+    rm -f /tmp/node.tar.xz; \
+    node --version; \
+    node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(':memory:'); console.log('runtime sqlite',db.prepare('select sqlite_version() as v').get().v); db.close();"
 
 # ---------------------------------------------------------------------------
 # Directory layout

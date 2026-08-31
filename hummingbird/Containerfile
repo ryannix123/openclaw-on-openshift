@@ -38,12 +38,13 @@ RUN dnf install -y git-core && \
 # ---------------------------------------------------------------------------
 # Stage 2: builder — install, compile, prune
 #
-# UBI 10 Node 24 with the full build toolchain (shell, git, gcc/make/python3).
-# OpenClaw v2026.8.x declares engines ">=24.15.0 <25" and builds on Node 24
-# upstream. This stage is thrown away after the final COPY — only the
-# distroless Hummingbird runtime ships.
+# Base: ubi10/ubi + OFFICIAL Node.js 24 from nodejs.org (NOT ubi10/nodejs-24).
+# OpenClaw 2.0 (v2026.8.x) requires WAL-reset-safe SQLite >=3.50.7. Red Hat's
+# nodejs-24 links the system libsqlite3 (RHEL 10 ships 3.46.1, unsafe, never
+# rebased). The official Node binary statically bundles SQLite 3.53.4 (safe),
+# so the build guard passes. This stage is discarded after the final COPY.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi10/nodejs-24 AS builder
+FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 
 USER 0
 WORKDIR /build
@@ -51,12 +52,32 @@ WORKDIR /build
 # CI=true prevents pnpm from requiring a TTY for interactive confirmations
 ENV CI=true
 
+# Build toolchain + tar/xz to unpack the official Node tarball.
+RUN dnf install -y git python3 make gcc gcc-c++ tar xz findutils && \
+    dnf clean all && rm -rf /var/cache/dnf
+
+# Official Node.js 24 (bundled safe SQLite 3.53.4).
+ARG NODE_VERSION=24.20.0
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  node_arch="x64" ;; \
+      aarch64) node_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+      -o /tmp/node.tar.xz; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+      --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
+    rm -f /tmp/node.tar.xz; \
+    node --version; \
+    node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(':memory:'); console.log('builder sqlite',db.prepare('select sqlite_version() as v').get().v); db.close();"
+
 COPY --from=source /source .
 
 # Activate pnpm at the version OpenClaw pins in package.json ("packageManager":
-# "pnpm@12.x"). UBI's bundled corepack may be absent or too old to parse the
-# hashed pin, so install a current corepack from npm first, then activate the
-# exact pinned version.
+# "pnpm@12.x"). The official Node ships a modern corepack; enable and activate
+# the pinned version.
 RUN npm install -g corepack@latest && \
     corepack enable && \
     PM="$(node -p "require('./package.json').packageManager" 2>/dev/null || echo '')" && \
