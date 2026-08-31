@@ -1,10 +1,10 @@
 <div align="center">
-  <img src=".github/openclaw-banner.png" width="640" alt="OpenClaw on OpenShift"/>
+  <img src=".github/logo.svg" width="640" alt="OpenClaw on OpenShift"/>
 
   <br/><br/>
 
   [![Build & Push](https://github.com/ryannix123/openclaw-on-openshift/actions/workflows/build.yml/badge.svg)](https://github.com/ryannix123/openclaw-on-openshift/actions/workflows/build.yml)
-  [![UBI 10](https://img.shields.io/badge/base-UBI%2010-EE0000?logo=redhat&logoColor=white)](https://catalog.redhat.com/software/containers/ubi10/nodejs-24)
+  [![UBI 10](https://img.shields.io/badge/base-UBI%2010-EE0000?logo=redhat&logoColor=white)](https://catalog.redhat.com/software/containers/ubi10/ubi)
   [![Hummingbird](https://img.shields.io/badge/base-Hummingbird%20%28distroless%29-EE0000?logo=redhat&logoColor=white)](https://hummingbird-project.io)
   [![Platform](https://img.shields.io/badge/platform-OpenShift-EE0000?logo=redhatopenshift&logoColor=white)](https://developers.redhat.com/developer-sandbox)
   [![Deploy](https://img.shields.io/badge/deploy-Ansible-EE0000?logo=ansible&logoColor=white)](https://docs.ansible.com/)
@@ -106,10 +106,10 @@ You'll also need a [Quay.io](https://quay.io) account and an API key from your A
 
 Two variants are available on [Quay.io](https://quay.io/repository/ryan_nix/openclaw-openshift) — choose based on your security requirements:
 
-| Variant | Runtime image | Tag | Entrypoint | Best for |
-|---|---|---|---|---|
-| **UBI 10** *(default)* | `ubi10/nodejs-24` (build: nodejs-22) | `:latest` | `entrypoint.sh` | Familiar tooling, full Red Hat ecosystem, shell access for debugging |
-| **Hummingbird** | `hi/nodejs:24` (distroless, build: nodejs-22) | `:hummingbird-latest` | `entrypoint.js` | Near-zero CVEs, smallest attack surface, regulated industries |
+| Variant | Base | Node.js | Tag | Entrypoint | Best for |
+|---|---|---|---|---|---|
+| **UBI 10** *(default)* | `ubi10/ubi` (RHEL 10) | Official 24 LTS | `:latest` | `entrypoint.sh` | Familiar tooling, full Red Hat ecosystem, shell access for debugging |
+| **Hummingbird** | `hi/nodejs` (distroless) | 24 | `:hummingbird-latest` | `entrypoint.js` | Near-zero CVEs, smallest attack surface, regulated industries |
 
 Both run Node.js 24 at runtime, are built nightly by GitHub Actions, and support all AI providers, channels, and custom skills. Switch between them with a single variable — no rebuild needed:
 
@@ -127,6 +127,10 @@ ansible-playbook openclaw-on-ocp.yml \
 ```
 
 Your PVC data (agent memory, config, workspace) is preserved across variant switches — only the container image changes.
+
+### Why the official Node.js binary?
+
+Both variants build on a Red Hat base (`ubi10/ubi`) but install the **official Node.js 24 LTS binary** from nodejs.org rather than Red Hat's `nodejs-24` image. This is deliberate: OpenClaw 2.0 requires WAL-reset-safe SQLite (≥ 3.50.7) for database integrity, and refuses to run against older versions. Red Hat's Node build dynamically links the *system* SQLite, which on RHEL 10 is 3.46.1 (affected by the WAL-reset bug and, per Red Hat's backport-only policy, never rebased). The official Node.js binary statically bundles SQLite 3.53.4, which is safe. Building on the UBI base keeps the RHEL 10 userland, Red Hat supply chain, and CVE story intact while satisfying OpenClaw's SQLite requirement.
 
 ### Hummingbird caveats
 
@@ -263,6 +267,8 @@ oc get secret openclaw-credentials \
 ```
 
 Open the URL, paste the token, and click **Connect**.
+
+> **OpenClaw 2.0 note:** The gateway runs behind OpenShift's HAProxy router, which OpenClaw 2.0 treats as a reverse proxy. The entrypoint sets `gateway.trustedProxies` to the standard OpenShift SDN ranges (`10.0.0.0/8`, `172.16.0.0/12`, `100.64.0.0/10`) so forwarded client headers are trusted — without this, OpenClaw 2.0 rejects every request with `proxy_attribution_required`. If your cluster uses non-default pod-network CIDRs, override with `-e openclaw_trusted_proxies='["<your-cidr>"]'`.
 
 On first connect from a new browser, OpenClaw requires device pairing approval. The playbook handles this automatically:
 
