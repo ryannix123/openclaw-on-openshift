@@ -114,6 +114,17 @@ cfg.gateway.auth.token               = process.env.OPENCLAW_GATEWAY_TOKEN || cfg
 cfg.gateway.controlUi                = cfg.gateway.controlUi                || {};
 cfg.gateway.controlUi.allowedOrigins = allowedOrigins;
 
+// OpenClaw 2.0 requires trustedProxies when running behind a reverse proxy.
+// On OpenShift the HAProxy router terminates TLS and forwards to the pod, so
+// the gateway sees a cluster-internal source IP rather than the real client.
+// Without this, OpenClaw 2.0 fails closed with "proxy_attribution_required".
+// Auth stays token-based; this only enables safe X-Forwarded-* handling.
+// Override with OPENCLAW_TRUSTED_PROXIES (JSON array) for non-default CIDRs.
+cfg.gateway.trustedProxies = JSON.parse(
+  process.env.OPENCLAW_TRUSTED_PROXIES ||
+  '["10.0.0.0/8","172.16.0.0/12","100.64.0.0/10"]'
+);
+
 // Default model from ai_provider mapping
 const defaultModel = process.env.OPENCLAW_DEFAULT_MODEL || "";
 if (defaultModel) {

@@ -122,6 +122,20 @@ cfg.gateway.auth.token = process.env.OPENCLAW_GATEWAY_TOKEN || cfg.gateway.auth.
 cfg.gateway.controlUi  = cfg.gateway.controlUi  || {};
 cfg.gateway.controlUi.allowedOrigins = JSON.parse(process.env.ALLOWED_ORIGINS);
 
+// OpenClaw 2.0 requires trustedProxies when running behind a reverse proxy.
+// On OpenShift the HAProxy router terminates TLS and forwards traffic to the
+// pod, so the gateway sees the request's source IP as a cluster-internal
+// address, not the real client. Without trustedProxies, OpenClaw 2.0 fails
+// closed with "proxy_attribution_required" (anti-spoofing for X-Forwarded-*).
+// We trust the pod/service network CIDRs the router forwards from. Auth stays
+// token-based (not trusted-proxy mode); this only enables safe forwarded-header
+// handling. Override with OPENCLAW_TRUSTED_PROXIES (JSON array) if your cluster
+// uses non-default network ranges.
+cfg.gateway.trustedProxies = JSON.parse(
+  process.env.OPENCLAW_TRUSTED_PROXIES ||
+  '["10.0.0.0/8","172.16.0.0/12","100.64.0.0/10"]'
+);
+
 // Set the default model from the OPENCLAW_DEFAULT_MODEL env var.
 // This ensures the agent uses the provider configured via Ansible
 // (e.g. anthropic/claude-sonnet-4-6) rather than whatever onboard picked.
