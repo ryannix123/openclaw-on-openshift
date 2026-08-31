@@ -754,14 +754,15 @@
     # -------------------------------------------------------------------------
     # Device pairing — automated first-browser approval
     #
-    # OpenClaw requires an explicit approval the first time a new browser
-    # connects. The playbook handles this automatically:
-    #   1. Wait for the pod to be fully Ready before prompting
-    #   2. Pause and prompt the user to open the browser and click Connect
-    #   3. Poll devices list every 5 seconds until a pending request appears
-    #   4. Extract the requestId and approve it
+    # OpenClaw 2.0 requires an explicit approval the first time a new browser
+    # connects, AND its pairing request IDs expire within seconds. A single
+    # poll-then-approve races the clock and usually loses. Instead we run a
+    # tight approve LOOP entirely inside the pod: for a fixed window, repeatedly
+    # list pending requests and approve every UUID found. Whatever request the
+    # browser generates when you click Connect gets approved within ~2 seconds,
+    # comfortably before it expires — no browser→terminal copy race.
     #
-    # Skip by passing -e skip_pairing=true (e.g. if already paired)
+    # Skip by passing -e skip_pairing=true (e.g. if the browser is already paired)
     # -------------------------------------------------------------------------
     - name: Wait for OpenClaw pod to be Ready before prompting
       ansible.builtin.command:
@@ -775,59 +776,73 @@
     - name: Prompt user to open browser and connect
       ansible.builtin.pause:
         prompt: >
-          OpenClaw is ready. Open the Control UI and click Connect:
+          OpenClaw is ready. Open the Control UI, paste the token if the field
+          is empty, and click Connect:
+
           https://{{ _route_host }}/?token={{ _token_value.stdout }}
 
-          Just press ENTER after clicking Connect — do not type anything.
+          Then press ENTER here. The playbook will auto-approve the pairing
+          request for ~60 seconds — just click Connect again in the browser
+          when it says the device was approved.
       when: state == 'present' and not (skip_pairing | default(false) | bool)
 
-    - name: Poll for pending device pairing request
+    # Continuous approve loop, run inside the pod. For up to ~60s it lists
+    # pending requests and approves each UUID it finds. Exits early and cleanly
+    # once at least one request has been approved. All logic runs in-pod so
+    # there is no per-iteration `oc exec` overhead and no expiry race.
+    - name: Auto-approve device pairing request (loop until approved)
       ansible.builtin.shell: |
-        oc exec -n {{ openclaw_namespace }} deploy/openclaw --           node dist/index.js devices list 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1
-      register: _pending_request_id
-      until: _pending_request_id.stdout | length > 0
-      retries: 12
-      delay: 5
-      changed_when: false
-      ignore_errors: true
+        oc exec -n {{ openclaw_namespace }} deploy/openclaw -- sh -c '
+          approved=0
+          for i in $(seq 1 30); do
+            ids=$(node dist/index.js devices list 2>/dev/null \
+              | grep -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+            for id in $ids; do
+              if node dist/index.js devices approve "$id" 2>/dev/null; then
+                echo "APPROVED $id"
+                approved=1
+              fi
+            done
+            [ "$approved" -eq 1 ] && break
+            sleep 2
+          done
+          [ "$approved" -eq 1 ] || echo "NO_REQUEST_APPROVED"
+        '
+      register: _pairing_loop
+      changed_when: "'APPROVED' in _pairing_loop.stdout"
+      failed_when: false
       when: state == 'present' and not (skip_pairing | default(false) | bool)
-
-    - name: Approve pending device pairing request
-      ansible.builtin.shell: |
-        oc exec -n {{ openclaw_namespace }} deploy/openclaw --           node dist/index.js devices approve {{ _pending_request_id.stdout | trim }}
-      register: _approve_result
-      ignore_errors: true
-      when:
-        - state == 'present'
-        - not (skip_pairing | default(false) | bool)
-        - _pending_request_id.stdout | default('') | length > 0
 
     - name: Print pairing result
       ansible.builtin.debug:
         msg:
-          - "Device pairing approved — click Connect again in the browser."
-          - "Your browser is now permanently paired. Future logins go straight through."
+          - "✅ Device pairing approved — click Connect again in the browser."
+          - "This browser is now paired. Future logins from it go straight through."
       when:
         - state == 'present'
         - not (skip_pairing | default(false) | bool)
-        - _approve_result is defined and _approve_result is not skipped and _approve_result is not failed
+        - _pairing_loop is defined
+        - "'APPROVED' in (_pairing_loop.stdout | default(''))"
 
     - name: Print manual pairing instructions (fallback)
       ansible.builtin.debug:
         msg:
           - "======================================================"
-          - "  Auto-pairing was not available (this is expected on"
-          - "  Hummingbird distroless images where 'devices list'"
-          - "  may not output the requestId)."
+          - "  No pairing request was approved automatically."
           - ""
-          - "  Approve manually using the requestId shown in the"
-          - "  browser's error message:"
+          - "  This usually means Connect wasn't clicked in time, or"
+          - "  the token field was empty. To pair manually:"
           - ""
-          - "    oc exec deploy/openclaw -- node dist/index.js devices approve <requestId>"
+          - "  1. In the browser, paste the gateway token and click Connect."
+          - "  2. Immediately run this one-liner (lists + approves in-pod):"
           - ""
-          - "  Then click Connect again in the browser."
+          - "     oc exec deploy/openclaw -- sh -c 'for id in $(node dist/index.js devices list 2>/dev/null | grep -oE \"[0-9a-f-]{36}\"); do node dist/index.js devices approve $id; done'"
+          - ""
+          - "  3. Click Connect again in the browser."
           - "======================================================"
       when:
         - state == 'present'
         - not (skip_pairing | default(false) | bool)
-        - _pending_request_id is failed or (_pending_request_id.stdout | default('') | length == 0)
+        - _pairing_loop is defined
+        - "'NO_REQUEST_APPROVED' in (_pairing_loop.stdout | default(''))"
+
