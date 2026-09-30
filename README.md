@@ -235,7 +235,7 @@ When both `openai_base_url` and `openai_model` are set, the entrypoint writes a 
         "baseUrl": "<openai_base_url>",
         "api": "openai-completions",
         "apiKey": "<openai_api_key or 'ignored'>",
-        "models": [{ "id": "<openai_model>" }]
+        "models": [{ "id": "<openai_model>", "name": "<openai_model>" }]
       }
     }
   },
@@ -248,6 +248,8 @@ When both `openai_base_url` and `openai_model` are set, the entrypoint writes a 
 ```
 
 This config persists on the PVC — pod restarts and image updates preserve your custom endpoint.
+
+> **OpenClaw 2.x note:** every provider model now requires a `name` as well as an `id`. Images built before 2026-09-30 omitted it, and the gateway refused to start with `models.providers.internal-llm.models[0].name: Invalid input`. Pull `:latest` (or `:hummingbird-latest`) and restart the pod — the entrypoint rewrites `openclaw.json` on every start, so no manual cleanup is needed. The entrypoint also removes the legacy `agents.defaults.models` allowlist that older images wrote.
 
 ### Caveats
 
@@ -313,6 +315,33 @@ oc exec deploy/openclaw -- node dist/index.js devices list
 ```
 
 Pairing is stored on the config PVC — one-time per browser, survives pod restarts.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Pod restarts during a chat; `lastState` shows exit code **137**, reason `Error` | Memory pressure froze the gateway and the liveness probe killed it (OpenClaw 2.x idles at ~700–850 MiB) | Redeploy with the current playbook (2Gi limit, relaxed probes), or `oc set resources deploy/openclaw -c openclaw-gateway --limits=memory=2Gi` |
+| Chat shows **"Delivery unconfirmed"** / "Queue paused" | The message was sent to a pod that restarted | Click **Retry** or **Discard** on the stuck message |
+| `OpenClaw config is invalid` … `models[0].name` | Pre-2026-09-30 image with an internal LLM configured | Pull the latest image and restart the pod |
+| `proxy_attribution_required` | Cluster pod network outside the default `trustedProxies` ranges | Pass `-e openclaw_trusted_proxies='["<your-cidr>"]'` |
+| `pairing required: device is not approved yet` | New browser or cleared site data | See [Accessing the Control UI](#accessing-the-control-ui) |
+
+Useful commands:
+
+```bash
+# Why did the last container exit?
+oc get pod -l app.kubernetes.io/name=openclaw \
+  -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="openclaw-gateway")].lastState}'; echo
+
+# Logs from the crashed container
+oc logs deploy/openclaw -c openclaw-gateway --previous | tail -60
+
+# Live memory use, and your namespace quota
+oc adm top pod
+oc describe quota
+```
 
 ---
 
