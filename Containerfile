@@ -39,8 +39,12 @@ ENV CI=true
 
 # Install build toolchain (git for clone; gcc/make/python3 for native modules).
 # xz is needed to unpack the Node.js .tar.xz tarball.
+# procps-ng provides `ps`: OpenClaw 2.x (v2026.9+) uses `ps -s <pid> -L` to
+# prove a killed process group is only zombies. Without it, build:docker's
+# write-cli-startup-metadata step fails with EPROCESSGROUP_CLEANUP_FAILED.
 RUN dnf install -y \
       git \
+      procps-ng \
       python3 \
       make \
       gcc \
@@ -72,6 +76,18 @@ RUN set -eux; \
     npm --version; \
     # Sanity-check that this Node's bundled SQLite is the safe one.
     node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(':memory:'); const v=db.prepare('select sqlite_version() as v').get().v; console.log('bundled sqlite',v); db.close();"
+
+# tini: static init/reaper (checksum-pinned). Used two ways:
+#   1. Build — `tini -s --` wraps pnpm build:docker as a subreaper so the
+#      help-render children OpenClaw kills get reaped instead of lingering as
+#      zombies (buildah RUN has no init process to reap them).
+#   2. Runtime — PID 1, exactly like upstream's `ENTRYPOINT ["tini","-s","--"]`.
+ARG TINI_VERSION=v0.19.0
+ARG TINI_SHA256=c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee
+RUN curl -fsSL "https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-static-amd64" \
+      -o /usr/local/bin/tini && \
+    echo "${TINI_SHA256}  /usr/local/bin/tini" | sha256sum -c - && \
+    chmod 0755 /usr/local/bin/tini
 
 # Clone a specific release tag (passed by CI) instead of HEAD.
 # HEAD of main moves daily and can be mid-development between releases,
@@ -117,7 +133,7 @@ RUN NODE_OPTIONS=--max-old-space-size=6144 \
     OPENCLAW_PREFER_PNPM=1 \
     OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
     pnpm_config_verify_deps_before_run=false \
-    pnpm build:docker
+    tini -s -- pnpm build:docker
 
 # Build the Control UI frontend bundle (separate from the backend build).
 # Without this the gateway serves "Control UI assets not found."
@@ -203,9 +219,11 @@ USER root
 
 # Runtime needs the official Node.js 24 (bundled safe SQLite) plus a few
 # runtime utilities. tar/xz to unpack Node; git because OpenClaw shells out to
-# it for some workspace operations; shadow-utils for user management.
+# it for some workspace operations; shadow-utils for user management;
+# procps-ng for `ps`, which OpenClaw 2.x's process-tree cleanup and
+# workspace-quiescence probes require (upstream's image ships procps too).
 ARG NODE_VERSION=24.20.0
-RUN dnf install -y tar xz git shadow-utils && \
+RUN dnf install -y tar xz git shadow-utils procps-ng && \
     dnf clean all && rm -rf /var/cache/dnf && \
     set -eux; \
     arch="$(uname -m)"; \
@@ -242,6 +260,8 @@ RUN mkdir -p /app /opt/openclaw/config /opt/openclaw/workspace && \
 # This protects against upstream OpenClaw adding new runtime resource paths
 # (e.g. src/agents/templates/HEARTBEAT.md in v2026.6.x).
 COPY --from=builder --chown=1001:0 /build /app
+# Static tini (no libc dependency) from the builder stage
+COPY --from=builder /usr/local/bin/tini /usr/local/bin/tini
 
 # Copy entrypoint
 COPY --chown=1001:0 entrypoint.sh /app/entrypoint.sh
@@ -272,4 +292,7 @@ EXPOSE 18789
 # Drop to non-root UID with GID 0 for OpenShift restricted SCC
 USER 1001
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+# tini as PID 1 (same as upstream: tini -s --). OpenClaw 2.x spawns and
+# kills whole process trees on every agent turn; without an init to reap the
+# orphans, zombies pile up and the gateway's cleanup checks fail.
+ENTRYPOINT ["/usr/local/bin/tini", "-s", "--", "/app/entrypoint.sh"]

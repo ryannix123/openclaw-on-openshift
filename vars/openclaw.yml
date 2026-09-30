@@ -92,13 +92,16 @@ openclaw_namespace: ""  # leave empty to use active oc project
 skip_pairing: false
 
 # Resource requests/limits tuned for Developer Sandbox quotas
+# OpenClaw 2.x spawns worker processes on every agent turn; 1Gi was enough
+# for 1.x but gets OOMKilled mid-conversation on 2.x. 2Gi fits comfortably
+# inside a Developer Sandbox namespace quota.
 openclaw_resources:
   requests:
     cpu: "200m"
-    memory: "512Mi"
+    memory: "768Mi"
   limits:
     cpu: "1000m"
-    memory: "1Gi"
+    memory: "2Gi"
 
 openclaw_replicas: 1
 

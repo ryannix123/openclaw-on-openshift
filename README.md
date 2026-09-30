@@ -132,6 +132,10 @@ Your PVC data (agent memory, config, workspace) is preserved across variant swit
 
 Both variants build on a Red Hat base (`ubi10/ubi`) but install the **official Node.js 24 LTS binary** from nodejs.org rather than Red Hat's `nodejs-24` image. This is deliberate: OpenClaw 2.0 requires WAL-reset-safe SQLite (≥ 3.50.7) for database integrity, and refuses to run against older versions. Red Hat's Node build dynamically links the *system* SQLite, which on RHEL 10 is 3.46.1 (affected by the WAL-reset bug and, per Red Hat's backport-only policy, never rebased). The official Node.js binary statically bundles SQLite 3.53.4, which is safe. Building on the UBI base keeps the RHEL 10 userland, Red Hat supply chain, and CVE story intact while satisfying OpenClaw's SQLite requirement.
 
+### Process supervision (tini)
+
+OpenClaw 2.x spawns and kills whole process trees on every agent turn and during the build. Both images now run under [tini](https://github.com/krallin/tini) as PID 1 (`tini -s --`), matching upstream's own Dockerfile, so orphaned child processes are reaped instead of piling up as zombies. The UBI image also ships `procps-ng` (`ps`), which OpenClaw uses to verify process-group cleanup. The default memory limit is **2Gi** — 1Gi was enough for 1.x but gets OOMKilled mid-conversation on 2.x. Override with `openclaw_resources` in `vars/openclaw.yml`.
+
 ### Hummingbird caveats
 
 The Hummingbird variant trades some operational convenience for a dramatically smaller attack surface. Know these before choosing it:
