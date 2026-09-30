@@ -132,8 +132,10 @@ if (defaultModel) {
   cfg.agents.defaults                     = cfg.agents.defaults                     || {};
   cfg.agents.defaults.model               = cfg.agents.defaults.model               || {};
   cfg.agents.defaults.model.primary       = defaultModel;
-  cfg.agents.defaults.models              = cfg.agents.defaults.models              || {};
-  cfg.agents.defaults.models[defaultModel] = cfg.agents.defaults.models[defaultModel] || {};
+  // OpenClaw 2.x: agents.defaults.models is a legacy allowlist that restricts
+  // model overrides. Drop it (also cleans configs persisted on the PVC by
+  // older images) — no modelPolicy means any configured model is allowed.
+  delete cfg.agents.defaults.models;
   log(`Default model set to: ${defaultModel}`);
 }
 
@@ -153,15 +155,16 @@ if (internalUrl && internalModel) {
     baseUrl: internalUrl,
     api:     "openai-completions",
     apiKey:  internalKey,
-    models:  [{ id: internalModel }],
+    models:  [{ id: internalModel, name: internalModel }],
   };
   cfg.agents                              = cfg.agents                              || {};
   cfg.agents.defaults                     = cfg.agents.defaults                     || {};
   cfg.agents.defaults.model               = cfg.agents.defaults.model               || {};
   cfg.agents.defaults.model.primary       = `internal-llm/${internalModel}`;
-  cfg.agents.defaults.models              = cfg.agents.defaults.models              || {};
-  cfg.agents.defaults.models[`internal-llm/${internalModel}`] =
-    cfg.agents.defaults.models[`internal-llm/${internalModel}`] || {};
+  // OpenClaw 2.x: agents.defaults.models is a legacy allowlist that restricts
+  // model overrides. Drop it (also cleans configs persisted on the PVC by
+  // older images) — no modelPolicy means any configured model is allowed.
+  delete cfg.agents.defaults.models;
   log(`Internal LLM configured: ${internalUrl}`);
   log(`Primary model overridden to: internal-llm/${internalModel}`);
 }

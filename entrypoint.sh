@@ -145,9 +145,10 @@ if (defaultModel) {
   cfg.agents.defaults = cfg.agents.defaults || {};
   cfg.agents.defaults.model = cfg.agents.defaults.model || {};
   cfg.agents.defaults.model.primary = defaultModel;
-  // Seed the allowlist so the model picker shows it immediately
-  cfg.agents.defaults.models = cfg.agents.defaults.models || {};
-  cfg.agents.defaults.models[defaultModel] = cfg.agents.defaults.models[defaultModel] || {};
+  // OpenClaw 2.x: agents.defaults.models is a legacy allowlist that restricts
+  // model overrides. Drop it (also cleans configs persisted on the PVC by
+  // older images) — no modelPolicy means any configured model is allowed.
+  delete cfg.agents.defaults.models;
   console.log("[entrypoint] Default model set to: " + defaultModel);
 }
 
@@ -169,22 +170,26 @@ if (internalUrl && internalModel) {
     baseUrl: internalUrl,
     api:     "openai-completions",
     apiKey:  internalKey,
-    models:  [{ id: internalModel }]
+    models:  [{ id: internalModel, name: internalModel }]
   };
   cfg.agents                              = cfg.agents                              || {};
   cfg.agents.defaults                     = cfg.agents.defaults                     || {};
   cfg.agents.defaults.model               = cfg.agents.defaults.model               || {};
   cfg.agents.defaults.model.primary       = "internal-llm/" + internalModel;
-  cfg.agents.defaults.models              = cfg.agents.defaults.models              || {};
-  cfg.agents.defaults.models["internal-llm/" + internalModel] =
-    cfg.agents.defaults.models["internal-llm/" + internalModel] || {};
+  // OpenClaw 2.x: agents.defaults.models is a legacy allowlist that restricts
+  // model overrides. Drop it (also cleans configs persisted on the PVC by
+  // older images) — no modelPolicy means any configured model is allowed.
+  delete cfg.agents.defaults.models;
   console.log("[entrypoint] Internal LLM configured: " + internalUrl);
   console.log("[entrypoint] Primary model overridden to: internal-llm/" + internalModel);
 }
 
 fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
 console.log("[entrypoint] openclaw.json written.");
-console.log(JSON.stringify({gateway: cfg.gateway, agents: cfg.agents}, null, 2));
+// Log the effective config with secrets redacted (gateway token, provider keys)
+const redacted = JSON.parse(JSON.stringify({gateway: cfg.gateway, agents: cfg.agents}));
+if (redacted.gateway && redacted.gateway.auth && redacted.gateway.auth.token) redacted.gateway.auth.token = "***redacted***";
+console.log(JSON.stringify(redacted, null, 2));
 JSEOF
 
 # ---------------------------------------------------------------------------
