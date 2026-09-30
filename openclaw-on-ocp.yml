@@ -654,19 +654,30 @@
                       - name: channel-config
                         mountPath: /opt/openclaw/channel-config
                         readOnly: true
+                    # OpenClaw 2.x can block the event loop for several
+                    # seconds during an agent turn. With the default 1s probe
+                    # timeout, kubelet declared the gateway dead ~2 min after
+                    # start and SIGKILLed it (exit 137, reason "Error").
+                    startupProbe:
+                      httpGet:
+                        path: /healthz
+                        port: gateway
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 30
                     livenessProbe:
                       httpGet:
                         path: /healthz
                         port: gateway
-                      initialDelaySeconds: 60
                       periodSeconds: 30
-                      failureThreshold: 3
+                      timeoutSeconds: 10
+                      failureThreshold: 6
                     readinessProbe:
                       httpGet:
                         path: /healthz
                         port: gateway
-                      initialDelaySeconds: 30
                       periodSeconds: 10
+                      timeoutSeconds: 5
                       failureThreshold: 5
                 volumes:
                   - name: config
