@@ -22,6 +22,42 @@ ai_api_key: "{{ vault_ai_api_key }}"
 openclaw_gateway_token: ""
 
 # ---------------------------------------------------------------------------
+# Authentication — "Log in with OpenShift"
+# ---------------------------------------------------------------------------
+
+# token:     shared gateway token + one-time device pairing per browser (default)
+# openshift: users click "Log in with OpenShift" and sign in with the cluster's
+#            identity provider. No token, no pairing. An oauth-proxy sidecar
+#            authenticates users; OpenClaw runs in trusted-proxy mode and
+#            auto-approves each signed-in user's browser.
+openclaw_auth: "token"   # token | openshift
+
+# Who may log in (openshift mode). Empty = anyone who can view Services in this
+# namespace, so granting access is just:
+#   oc adm policy add-role-to-user view <username> -n <namespace>
+# Otherwise, a JSON SubjectAccessReview, e.g.
+#   '{"namespace":"openclaw","resource":"pods","verb":"list"}'
+openclaw_oauth_sar: ""
+
+# OpenShift usernames that get OpenClaw admin (settings, plugins, approvals).
+# Empty = the user running the playbook (oc whoami). Everyone else who logs in
+# gets read/write/approvals — enough to chat and run agents.
+openclaw_admin_users: []
+
+# Optional extra allowlist enforced by OpenClaw itself (OpenShift usernames).
+# Empty = rely on openclaw_oauth_sar alone.
+openclaw_allowed_users: []
+
+# oauth-proxy image. Empty = the cluster's own openshift/oauth-proxy
+# ImageStream (matches the cluster version, no pull secret), falling back to
+# registry.redhat.io/openshift4/ose-oauth-proxy-rhel9:latest.
+openclaw_oauth_proxy_image: ""
+
+# Token mode only: CIDRs of the OpenShift router/pod network that forward
+# client headers. Empty = 10.0.0.0/8, 172.16.0.0/12, 100.64.0.0/10.
+openclaw_trusted_proxies: []
+
+# ---------------------------------------------------------------------------
 # Container Image & Variant
 # ---------------------------------------------------------------------------
 

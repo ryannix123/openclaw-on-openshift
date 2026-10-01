@@ -122,6 +122,14 @@ cfg.gateway.auth.token = process.env.OPENCLAW_GATEWAY_TOKEN || cfg.gateway.auth.
 cfg.gateway.controlUi  = cfg.gateway.controlUi  || {};
 cfg.gateway.controlUi.allowedOrigins = JSON.parse(process.env.ALLOWED_ORIGINS);
 
+// Accepts a JSON array or a comma-separated list (Ansible passes CSV)
+function envList(name, dflt) {
+  const v = (process.env[name] || "").trim();
+  if (!v) return dflt;
+  if (v.charAt(0) === "[") return JSON.parse(v);
+  return v.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+}
+
 // OpenClaw 2.0 requires trustedProxies when running behind a reverse proxy.
 // On OpenShift the HAProxy router terminates TLS and forwards traffic to the
 // pod, so the gateway sees the request's source IP as a cluster-internal
@@ -131,10 +139,46 @@ cfg.gateway.controlUi.allowedOrigins = JSON.parse(process.env.ALLOWED_ORIGINS);
 // token-based (not trusted-proxy mode); this only enables safe forwarded-header
 // handling. Override with OPENCLAW_TRUSTED_PROXIES (JSON array) if your cluster
 // uses non-default network ranges.
-cfg.gateway.trustedProxies = JSON.parse(
-  process.env.OPENCLAW_TRUSTED_PROXIES ||
-  '["10.0.0.0/8","172.16.0.0/12","100.64.0.0/10"]'
-);
+cfg.gateway.trustedProxies = envList("OPENCLAW_TRUSTED_PROXIES", ["10.0.0.0/8","172.16.0.0/12","100.64.0.0/10"]);
+
+// ---------------------------------------------------------------------------
+// Authentication mode
+//   token         (default) shared gateway token + device pairing
+//   trusted-proxy "Log in with OpenShift": an oauth-proxy sidecar in this pod
+//                 authenticates the user against the cluster OAuth server and
+//                 forwards X-Forwarded-User over loopback. The gateway trusts
+//                 identity headers ONLY from 127.0.0.1/::1, so nothing else on
+//                 the pod network can impersonate a user. OpenClaw forbids a
+//                 shared token in this mode, so it is removed.
+// ---------------------------------------------------------------------------
+const authMode = process.env.OPENCLAW_AUTH_MODE || "token";
+if (authMode === "trusted-proxy") {
+  const tp = {
+    userHeader:        process.env.OPENCLAW_TRUSTED_PROXY_USER_HEADER || "x-forwarded-user",
+    allowLoopback:     true,
+    deviceAutoApprove: { enabled: true }
+  };
+  const allowUsers = envList("OPENCLAW_TRUSTED_PROXY_ALLOW_USERS", []);
+  if (allowUsers.length > 0) tp.allowUsers = allowUsers;
+  const auth = { mode: "trusted-proxy", trustedProxy: tp };
+  const adminUsers = envList("OPENCLAW_ADMIN_USERS", []);
+  if (adminUsers.length > 0) {
+    auth.identityScopes = {};
+    adminUsers.forEach(function (u) { auth.identityScopes[u] = ["operator.admin"]; });
+  }
+  // Local-direct password for in-pod CLI calls (oc exec ... openclaw ...)
+  if (process.env.OPENCLAW_GATEWAY_PASSWORD) auth.password = process.env.OPENCLAW_GATEWAY_PASSWORD;
+  cfg.gateway.auth           = auth;
+  cfg.gateway.trustedProxies = ["127.0.0.1/32", "::1/128"];
+  console.log("[entrypoint] Auth mode: trusted-proxy (Log in with OpenShift); admins: " +
+              (adminUsers.length ? adminUsers.join(", ") : "none"));
+} else {
+  // Token mode — also cleans up trusted-proxy settings left on the PVC
+  cfg.gateway.auth.mode = "token";
+  delete cfg.gateway.auth.trustedProxy;
+  delete cfg.gateway.auth.identityScopes;
+  delete cfg.gateway.auth.password;
+}
 
 // Set the default model from the OPENCLAW_DEFAULT_MODEL env var.
 // This ensures the agent uses the provider configured via Ansible
@@ -188,7 +232,10 @@ fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
 console.log("[entrypoint] openclaw.json written.");
 // Log the effective config with secrets redacted (gateway token, provider keys)
 const redacted = JSON.parse(JSON.stringify({gateway: cfg.gateway, agents: cfg.agents}));
-if (redacted.gateway && redacted.gateway.auth && redacted.gateway.auth.token) redacted.gateway.auth.token = "***redacted***";
+if (redacted.gateway && redacted.gateway.auth) {
+  if (redacted.gateway.auth.token)    redacted.gateway.auth.token    = "***redacted***";
+  if (redacted.gateway.auth.password) redacted.gateway.auth.password = "***redacted***";
+}
 console.log(JSON.stringify(redacted, null, 2));
 JSEOF
 
@@ -235,4 +282,8 @@ fi
 # Start the gateway (replaces this shell process as PID 1)
 # ---------------------------------------------------------------------------
 echo "[entrypoint] Launching OpenClaw gateway on port 18789..."
+# trusted-proxy mode refuses to start if a shared token is present in the env
+if [[ "${OPENCLAW_AUTH_MODE:-token}" == "trusted-proxy" ]]; then
+    unset OPENCLAW_GATEWAY_TOKEN
+fi
 exec node /app/dist/index.js gateway --allow-unconfigured

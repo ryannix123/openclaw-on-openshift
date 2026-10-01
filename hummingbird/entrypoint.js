@@ -114,16 +114,60 @@ cfg.gateway.auth.token               = process.env.OPENCLAW_GATEWAY_TOKEN || cfg
 cfg.gateway.controlUi                = cfg.gateway.controlUi                || {};
 cfg.gateway.controlUi.allowedOrigins = allowedOrigins;
 
+// Accepts a JSON array or a comma-separated list (Ansible passes CSV)
+function envList(name, dflt) {
+  const v = (process.env[name] || "").trim();
+  if (!v) return dflt;
+  if (v.charAt(0) === "[") return JSON.parse(v);
+  return v.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+}
+
 // OpenClaw 2.0 requires trustedProxies when running behind a reverse proxy.
 // On OpenShift the HAProxy router terminates TLS and forwards to the pod, so
 // the gateway sees a cluster-internal source IP rather than the real client.
 // Without this, OpenClaw 2.0 fails closed with "proxy_attribution_required".
 // Auth stays token-based; this only enables safe X-Forwarded-* handling.
 // Override with OPENCLAW_TRUSTED_PROXIES (JSON array) for non-default CIDRs.
-cfg.gateway.trustedProxies = JSON.parse(
-  process.env.OPENCLAW_TRUSTED_PROXIES ||
-  '["10.0.0.0/8","172.16.0.0/12","100.64.0.0/10"]'
-);
+cfg.gateway.trustedProxies = envList("OPENCLAW_TRUSTED_PROXIES", ["10.0.0.0/8","172.16.0.0/12","100.64.0.0/10"]);
+
+// ---------------------------------------------------------------------------
+// Authentication mode
+//   token         (default) shared gateway token + device pairing
+//   trusted-proxy "Log in with OpenShift": an oauth-proxy sidecar in this pod
+//                 authenticates the user against the cluster OAuth server and
+//                 forwards X-Forwarded-User over loopback. The gateway trusts
+//                 identity headers ONLY from 127.0.0.1/::1, so nothing else on
+//                 the pod network can impersonate a user. OpenClaw forbids a
+//                 shared token in this mode, so it is removed.
+// ---------------------------------------------------------------------------
+const authMode = process.env.OPENCLAW_AUTH_MODE || "token";
+if (authMode === "trusted-proxy") {
+  const tp = {
+    userHeader:        process.env.OPENCLAW_TRUSTED_PROXY_USER_HEADER || "x-forwarded-user",
+    allowLoopback:     true,
+    deviceAutoApprove: { enabled: true }
+  };
+  const allowUsers = envList("OPENCLAW_TRUSTED_PROXY_ALLOW_USERS", []);
+  if (allowUsers.length > 0) tp.allowUsers = allowUsers;
+  const auth = { mode: "trusted-proxy", trustedProxy: tp };
+  const adminUsers = envList("OPENCLAW_ADMIN_USERS", []);
+  if (adminUsers.length > 0) {
+    auth.identityScopes = {};
+    adminUsers.forEach(function (u) { auth.identityScopes[u] = ["operator.admin"]; });
+  }
+  // Local-direct password for in-pod CLI calls (oc exec ... openclaw ...)
+  if (process.env.OPENCLAW_GATEWAY_PASSWORD) auth.password = process.env.OPENCLAW_GATEWAY_PASSWORD;
+  cfg.gateway.auth           = auth;
+  cfg.gateway.trustedProxies = ["127.0.0.1/32", "::1/128"];
+  log("Auth mode: trusted-proxy (Log in with OpenShift); admins: " +
+              (adminUsers.length ? adminUsers.join(", ") : "none"));
+} else {
+  // Token mode — also cleans up trusted-proxy settings left on the PVC
+  cfg.gateway.auth.mode = "token";
+  delete cfg.gateway.auth.trustedProxy;
+  delete cfg.gateway.auth.identityScopes;
+  delete cfg.gateway.auth.password;
+}
 
 // Default model from ai_provider mapping
 const defaultModel = process.env.OPENCLAW_DEFAULT_MODEL || "";
@@ -211,8 +255,13 @@ if (channelConfigPath && existsSync(channelConfigPath)) {
 // ---------------------------------------------------------------------------
 log("Launching OpenClaw gateway on port 18789...");
 
+// trusted-proxy mode refuses to start if a shared token is present in the env
+const gatewayEnv = { ...process.env };
+if (authMode === "trusted-proxy") delete gatewayEnv.OPENCLAW_GATEWAY_TOKEN;
+
 const gateway = spawn("node", [APP, "gateway", "--allow-unconfigured"], {
   stdio: "inherit",
+  env: gatewayEnv,
 });
 
 process.on("SIGTERM", () => {

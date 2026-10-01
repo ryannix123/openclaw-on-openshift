@@ -318,6 +318,47 @@ Pairing is stored on the config PVC — one-time per browser, survives pod resta
 
 ---
 
+## Log in with OpenShift (SSO)
+
+Skip the gateway token and the device-pairing dance entirely. With `openclaw_auth=openshift`, visitors click **Log in with OpenShift**, sign in with whatever identity provider your cluster already trusts (Red Hat SSO, Entra ID, Okta, LDAP, GitHub…), and land straight in the Control UI.
+
+```bash
+ansible-playbook openclaw-on-ocp.yml -e ai_api_key=sk-ant-... -e openclaw_auth=openshift
+```
+
+**Invite a colleague** (and revoke them) with plain OpenShift RBAC — no tokens to hand out:
+
+```bash
+oc adm policy add-role-to-user view <their-openshift-username>
+oc adm policy remove-role-from-user view <their-openshift-username>
+```
+
+### How it works
+
+```
+Browser ──▶ Route ──▶ oauth-proxy (sidecar :8080) ──loopback──▶ OpenClaw gateway (:18789)
+                         │  signs user in via the cluster OAuth server
+                         └─ sets X-Forwarded-User: <openshift username>
+```
+
+- **The ServiceAccount is the OAuth client.** `openclaw-proxy` carries an `oauth-redirectreference` annotation pointing at the Route, so no cluster-admin rights or `OAuthClient` object are needed — it works in a Developer Sandbox namespace.
+- **OpenClaw runs in `trusted-proxy` auth mode** and trusts identity headers **only from loopback** (the sidecar). Anything else on the pod network that reaches port 18789 has no credential to present.
+- **Browsers are auto-approved** after sign-in (`deviceAutoApprove`), so there is no pairing step.
+- **Admins:** the user who ran the playbook gets `operator.admin`; override with `openclaw_admin_users`. Everyone else gets read/write/approvals — enough to chat and run agents.
+- **Who can log in:** anyone who can `get services` in the namespace (i.e. has `view`). Tighten with `openclaw_oauth_sar` or add an explicit `openclaw_allowed_users` list.
+- The gateway token is removed in this mode (OpenClaw refuses to start with both). A random local password is stored in the `openclaw-proxy` Secret for in-pod CLI commands.
+
+Switch back any time with `-e openclaw_auth=token`; the playbook removes the proxy resources and the entrypoint restores token auth.
+
+### Caveats
+
+- **WhatsApp Business webhooks** need unauthenticated inbound requests, so the playbook refuses to combine them with SSO. Telegram, Discord, Slack, Matrix and Teams are outbound and unaffected.
+- **NetworkPolicy** `openclaw-sso-ingress` limits pod ingress to the proxy port as defense in depth. Namespaces with broader allow policies (Developer Sandbox ships some) widen it; the loopback-only trust above is the real boundary.
+- **Local processes are trusted.** Anything running inside the gateway container (including agent tool calls) can reach the gateway on loopback — the same trust it already has over the config on the PVC.
+- The oauth-proxy image defaults to the cluster's own `openshift/oauth-proxy` ImageStream; set `openclaw_oauth_proxy_image` to pin another.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -326,6 +367,8 @@ Pairing is stored on the config PVC — one-time per browser, survives pod resta
 | Chat shows **"Delivery unconfirmed"** / "Queue paused" | The message was sent to a pod that restarted | Click **Retry** or **Discard** on the stuck message |
 | `OpenClaw config is invalid` … `models[0].name` | Pre-2026-09-30 image with an internal LLM configured | Pull the latest image and restart the pod |
 | `proxy_attribution_required` | Cluster pod network outside the default `trustedProxies` ranges | Pass `-e openclaw_trusted_proxies='["<your-cidr>"]'` |
+| **403** from the login page after signing in (SSO mode) | Your user fails `openclaw_oauth_sar` (no `view` on the namespace) | `oc adm policy add-role-to-user view <username>` |
+| Gateway won't start: `trusted-proxy, but a shared token is also configured` | Token left in the env or config | Rerun the playbook with `openclaw_auth=openshift` (it drops the token) |
 | `pairing required: device is not approved yet` | New browser or cleared site data | See [Accessing the Control UI](#accessing-the-control-ui) |
 
 Useful commands:

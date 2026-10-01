@@ -77,6 +77,13 @@
          else _variant_image_map[openclaw_variant] | default(_variant_image_map['ubi10']) }}
 
 
+    # ── "Log in with OpenShift" (openclaw_auth: openshift) ────────────────────
+    _sso: "{{ openclaw_auth | default('token') == 'openshift' }}"
+    # Default: anyone who can view Services in this namespace may log in.
+    _oauth_sar: >-
+      {{ openclaw_oauth_sar if openclaw_oauth_sar | default('') | length > 0
+         else ({'namespace': openclaw_namespace, 'resource': 'services', 'verb': 'get'} | to_json) }}
+
     _any_channel_enabled: >-
       {{ (_telegram_enabled or _discord_enabled or _slack_enabled
           or _whatsapp_enabled or _matrix_enabled or _teams_enabled) | bool }}
@@ -121,6 +128,20 @@
           - ai_api_key | length > 0
         fail_msg: "ai_api_key must be set (pass via -e or Ansible Vault)"
       when: state == 'present'
+
+    - name: Validate openclaw_auth value
+      ansible.builtin.assert:
+        that: openclaw_auth | default('token') in ['token', 'openshift']
+        fail_msg: "openclaw_auth must be 'token' or 'openshift' (got '{{ openclaw_auth }}')"
+      when: state == 'present'
+
+    - name: Reject WhatsApp webhooks with Log in with OpenShift
+      ansible.builtin.fail:
+        msg: >-
+          WhatsApp Business needs an unauthenticated inbound webhook, which
+          'Log in with OpenShift' would block. Use openclaw_auth=token, or
+          disable the WhatsApp channel.
+      when: state == 'present' and _sso | bool and _whatsapp_enabled | bool
 
     - name: Validate Telegram bot_token
       ansible.builtin.assert:
@@ -225,6 +246,20 @@
         namespace: "{{ openclaw_namespace }}"
       when: state == 'absent'
 
+    - name: Delete Log in with OpenShift resources
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.api }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+        namespace: "{{ openclaw_namespace }}"
+      loop:
+        - { api: networking.k8s.io/v1, kind: NetworkPolicy,  name: openclaw-sso-ingress }
+        - { api: v1,                   kind: Secret,         name: openclaw-proxy }
+        - { api: v1,                   kind: ServiceAccount, name: openclaw-proxy }
+      failed_when: false
+      when: state == 'absent'
+
     - name: Delete credentials Secret
       kubernetes.core.k8s:
         state: absent
@@ -325,6 +360,102 @@
           }}
       when: state == 'present'
 
+    # ── "Log in with OpenShift" prep ───────────────────────────────────────────
+    - name: Identify the user running the playbook (default OpenClaw admin)
+      ansible.builtin.command: oc whoami
+      register: _oc_whoami
+      changed_when: false
+      when: state == 'present' and _sso | bool
+
+    - name: Set admin user list
+      ansible.builtin.set_fact:
+        _admin_users: >-
+          {{ openclaw_admin_users if openclaw_admin_users | default([]) | length > 0
+             else [_oc_whoami.stdout | trim] }}
+      when: state == 'present' and _sso | bool
+
+    - name: Look up existing oauth-proxy Secret (keeps sessions across re-runs)
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: openclaw-proxy
+        namespace: "{{ openclaw_namespace }}"
+      register: _proxy_secret_info
+      when: state == 'present' and _sso | bool
+
+    - name: Resolve cookie secret and in-pod CLI password
+      ansible.builtin.set_fact:
+        _cookie_secret: >-
+          {{ (_proxy_secret_info.resources[0].data.session_secret | b64decode)
+             if (_proxy_secret_info.resources | length > 0)
+             else lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}
+        _gateway_password: >-
+          {{ (_proxy_secret_info.resources[0].data.gateway_password | b64decode)
+             if (_proxy_secret_info.resources | length > 0
+                 and 'gateway_password' in _proxy_secret_info.resources[0].data)
+             else lookup('password', '/dev/null chars=hexdigits length=64') }}
+      when: state == 'present' and _sso | bool
+
+    - name: Look up the cluster's oauth-proxy ImageStream
+      kubernetes.core.k8s_info:
+        api_version: image.openshift.io/v1
+        kind: ImageStream
+        name: oauth-proxy
+        namespace: openshift
+      register: _oauth_is
+      failed_when: false
+      when: state == 'present' and _sso | bool and openclaw_oauth_proxy_image | default('') | length == 0
+
+    # Prefer the oauth-proxy image that ships with the cluster (matches its
+    # version, no extra pull secret); fall back to Red Hat's registry.
+    - name: Resolve oauth-proxy image
+      ansible.builtin.set_fact:
+        _oauth_proxy_image: >-
+          {{ openclaw_oauth_proxy_image if openclaw_oauth_proxy_image | default('') | length > 0
+             else ((_oauth_is.resources[0].status.dockerImageRepository ~ ':v4.4')
+                   if (_oauth_is.resources | default([]) | length > 0
+                       and _oauth_is.resources[0].status.dockerImageRepository | default('') | length > 0)
+                   else 'registry.redhat.io/openshift4/ose-oauth-proxy-rhel9:latest') }}
+      when: state == 'present' and _sso | bool
+
+    - name: Create/update oauth-proxy Secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: openclaw-proxy
+            namespace: "{{ openclaw_namespace }}"
+            labels:
+              app.kubernetes.io/name: openclaw
+              app.kubernetes.io/component: oauth-proxy
+          type: Opaque
+          stringData:
+            session_secret: "{{ _cookie_secret }}"
+            gateway_password: "{{ _gateway_password }}"
+      when: state == 'present' and _sso | bool
+
+    # The ServiceAccount *is* the OAuth client. The redirect-reference
+    # annotation tells the cluster OAuth server which Route may receive the
+    # login callback — no cluster-admin, no OAuthClient object needed.
+    - name: Create/update oauth-proxy ServiceAccount (OAuth client)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: openclaw-proxy
+            namespace: "{{ openclaw_namespace }}"
+            labels:
+              app.kubernetes.io/name: openclaw
+              app.kubernetes.io/component: oauth-proxy
+            annotations:
+              serviceaccounts.openshift.io/oauth-redirectreference.primary: >-
+                {"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"openclaw"}}
+      when: state == 'present' and _sso | bool
+
     - name: Create/update credentials Secret
       kubernetes.core.k8s:
         state: present
@@ -340,8 +471,9 @@
           type: Opaque
           stringData: >-
             {{
-              {"OPENCLAW_GATEWAY_TOKEN": _gateway_token,
-               _api_key_env_var: ai_api_key}
+              ({"OPENCLAW_GATEWAY_PASSWORD": _gateway_password}
+                if _sso | bool else {"OPENCLAW_GATEWAY_TOKEN": _gateway_token})
+              | combine({_api_key_env_var: ai_api_key})
               | combine(_channel_secret_data)
               | combine(
                   {"OPENCLAW_OPENAI_API_KEY": openai_api_key}
@@ -354,7 +486,7 @@
     - name: Display generated gateway token (save this!)
       ansible.builtin.debug:
         msg: "OPENCLAW_GATEWAY_TOKEN = {{ _gateway_token }}"
-      when: state == 'present' and openclaw_gateway_token | length == 0
+      when: state == 'present' and openclaw_gateway_token | length == 0 and not (_sso | bool)
 
     # ── ConfigMaps ─────────────────────────────────────────────────────────────
     - name: Render channel config JSON from template
@@ -474,11 +606,10 @@
           spec:
             selector:
               app.kubernetes.io/name: openclaw
-            ports:
-              - name: gateway
-                port: 18789
-                targetPort: gateway
-                protocol: TCP
+            ports: >-
+              {{ [{'name': 'gateway', 'port': 18789, 'targetPort': 'gateway', 'protocol': 'TCP'}]
+                 + ([{'name': 'proxy', 'port': 8080, 'targetPort': 'proxy', 'protocol': 'TCP'}]
+                    if _sso | bool else []) }}
       when: state == 'present'
 
     - name: Create Route
@@ -503,7 +634,8 @@
               kind: Service
               name: openclaw
             port:
-              targetPort: gateway
+              # Log in with OpenShift: traffic enters through the oauth-proxy sidecar
+              targetPort: "{{ 'proxy' if _sso | bool else 'gateway' }}"
             tls:
               termination: edge
               insecureEdgeTerminationPolicy: Redirect
@@ -525,6 +657,144 @@
       ansible.builtin.set_fact:
         _route_host: "{{ _route_info.resources[0].spec.host }}"
       when: state == 'present'
+
+    # ── Container specs (gateway + optional oauth-proxy sidecar) ──────────────
+    - name: Build gateway container spec
+      ansible.builtin.set_fact:
+        _gateway_container:
+          name: openclaw-gateway
+          image: "{{ _resolved_image }}"
+          imagePullPolicy: Always
+          ports:
+            - name: gateway
+              containerPort: 18789
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: openclaw-credentials
+          env:
+            - name: OPENCLAW_CONFIG_DIR
+              value: /opt/openclaw/.openclaw
+            - name: OPENCLAW_WORKSPACE_DIR
+              value: /opt/openclaw/workspace
+            - name: OPENCLAW_DISABLE_BONJOUR
+              value: "1"
+            - name: NODE_ENV
+              value: production
+            - name: HOME
+              value: /opt/openclaw
+            - name: OPENCLAW_DEFAULT_MODEL
+              value: "{{ _resolved_model }}"
+            - name: OPENCLAW_PUBLIC_URL
+              value: "https://{{ _route_host }}"
+            - name: OPENCLAW_CHANNEL_CONFIG_PATH
+              value: "{{ '/opt/openclaw/channel-config/channels-config.json' if _any_channel_enabled else '' }}"
+            # Internal LLM (OpenAI-compatible) overrides — entrypoint
+            # writes a custom provider to openclaw.json when both are set.
+            - name: OPENCLAW_OPENAI_BASE_URL
+              value: "{{ openai_base_url | default('') }}"
+            - name: OPENCLAW_OPENAI_MODEL
+              value: "{{ openai_model | default('') }}"
+            # Authentication mode — see "Log in with OpenShift" in README
+            - name: OPENCLAW_AUTH_MODE
+              value: "{{ 'trusted-proxy' if _sso else 'token' }}"
+            - name: OPENCLAW_ADMIN_USERS
+              value: "{{ _admin_users | join(',') if _sso else '' }}"
+            - name: OPENCLAW_TRUSTED_PROXY_ALLOW_USERS
+              value: "{{ openclaw_allowed_users | default([]) | join(',') }}"
+            - name: OPENCLAW_TRUSTED_PROXIES
+              value: "{{ openclaw_trusted_proxies | default([]) | join(',') }}"
+          resources: "{{ openclaw_resources }}"
+          volumeMounts:
+            - name: config
+              mountPath: /opt/openclaw/.openclaw
+            - name: workspace
+              mountPath: /opt/openclaw/workspace
+            - name: channel-config
+              mountPath: /opt/openclaw/channel-config
+              readOnly: true
+          # OpenClaw 2.x can block the event loop for several
+          # seconds during an agent turn. With the default 1s probe
+          # timeout, kubelet declared the gateway dead ~2 min after
+          # start and SIGKILLed it (exit 137, reason "Error").
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+      when: state == 'present'
+
+    - name: Build oauth-proxy sidecar spec ("Log in with OpenShift")
+      ansible.builtin.set_fact:
+        _sidecar_containers:
+          - name: oauth-proxy
+            image: "{{ _oauth_proxy_image }}"
+            imagePullPolicy: IfNotPresent
+            args:
+              - --provider=openshift
+              - --openshift-service-account=openclaw-proxy
+              - --http-address=0.0.0.0:8080
+              - --https-address=
+              - --upstream=http://127.0.0.1:18789
+              - --cookie-secret=$(OAUTH_COOKIE_SECRET)
+              - --skip-provider-button=true
+              - --email-domain=*
+              # Identity goes to OpenClaw in X-Forwarded-User (always overwritten
+              # by the proxy). Basic-auth passthrough is off so the gateway never
+              # sees an Authorization header it might misread as a credential.
+              - --pass-user-headers=true
+              - --pass-basic-auth=false
+              - --pass-access-token=false
+              - "--openshift-sar={{ _oauth_sar }}"
+            env:
+              - name: OAUTH_COOKIE_SECRET
+                valueFrom:
+                  secretKeyRef:
+                    name: openclaw-proxy
+                    key: session_secret
+            ports:
+              - name: proxy
+                containerPort: 8080
+                protocol: TCP
+            readinessProbe:
+              httpGet:
+                path: /oauth/healthz
+                port: proxy
+              periodSeconds: 10
+            livenessProbe:
+              httpGet:
+                path: /oauth/healthz
+                port: proxy
+              periodSeconds: 30
+              timeoutSeconds: 5
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 200m
+                memory: 128Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: [ALL]
+      when: state == 'present' and _sso | bool
 
     # ── Deployment ─────────────────────────────────────────────────────────────
     - name: Deploy OpenClaw
@@ -611,74 +881,8 @@
                       - name: custom-skills
                         mountPath: /opt/openclaw/skill-sources
                         readOnly: true
-                containers:
-                  - name: openclaw-gateway
-                    image: "{{ _resolved_image }}"
-                    imagePullPolicy: Always
-                    ports:
-                      - name: gateway
-                        containerPort: 18789
-                        protocol: TCP
-                    envFrom:
-                      - secretRef:
-                          name: openclaw-credentials
-                    env:
-                      - name: OPENCLAW_CONFIG_DIR
-                        value: /opt/openclaw/.openclaw
-                      - name: OPENCLAW_WORKSPACE_DIR
-                        value: /opt/openclaw/workspace
-                      - name: OPENCLAW_DISABLE_BONJOUR
-                        value: "1"
-                      - name: NODE_ENV
-                        value: production
-                      - name: HOME
-                        value: /opt/openclaw
-                      - name: OPENCLAW_DEFAULT_MODEL
-                        value: "{{ _resolved_model }}"
-                      - name: OPENCLAW_PUBLIC_URL
-                        value: "https://{{ _route_host }}"
-                      - name: OPENCLAW_CHANNEL_CONFIG_PATH
-                        value: "{{ '/opt/openclaw/channel-config/channels-config.json' if _any_channel_enabled else '' }}"
-                      # Internal LLM (OpenAI-compatible) overrides — entrypoint
-                      # writes a custom provider to openclaw.json when both are set.
-                      - name: OPENCLAW_OPENAI_BASE_URL
-                        value: "{{ openai_base_url | default('') }}"
-                      - name: OPENCLAW_OPENAI_MODEL
-                        value: "{{ openai_model | default('') }}"
-                    resources: "{{ openclaw_resources }}"
-                    volumeMounts:
-                      - name: config
-                        mountPath: /opt/openclaw/.openclaw
-                      - name: workspace
-                        mountPath: /opt/openclaw/workspace
-                      - name: channel-config
-                        mountPath: /opt/openclaw/channel-config
-                        readOnly: true
-                    # OpenClaw 2.x can block the event loop for several
-                    # seconds during an agent turn. With the default 1s probe
-                    # timeout, kubelet declared the gateway dead ~2 min after
-                    # start and SIGKILLed it (exit 137, reason "Error").
-                    startupProbe:
-                      httpGet:
-                        path: /healthz
-                        port: gateway
-                      periodSeconds: 10
-                      timeoutSeconds: 5
-                      failureThreshold: 30
-                    livenessProbe:
-                      httpGet:
-                        path: /healthz
-                        port: gateway
-                      periodSeconds: 30
-                      timeoutSeconds: 10
-                      failureThreshold: 6
-                    readinessProbe:
-                      httpGet:
-                        path: /healthz
-                        port: gateway
-                      periodSeconds: 10
-                      timeoutSeconds: 5
-                      failureThreshold: 5
+                serviceAccountName: "{{ 'openclaw-proxy' if _sso else 'default' }}"
+                containers: "{{ [_gateway_container] + (_sidecar_containers if _sso else []) }}"
                 volumes:
                   - name: config
                     persistentVolumeClaim:
@@ -695,6 +899,56 @@
                       name: openclaw-channel-config
                       optional: true
       when: state == 'present'
+
+    # Defense in depth. The real guarantee is that the gateway trusts identity
+    # headers only from loopback (the sidecar). This policy additionally keeps
+    # other pods off the gateway port. Broader allow policies in the namespace
+    # (e.g. Developer Sandbox defaults) are additive and can widen it.
+    - name: Restrict gateway ingress to the oauth-proxy port
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: openclaw-sso-ingress
+            namespace: "{{ openclaw_namespace }}"
+            labels:
+              app.kubernetes.io/name: openclaw
+          spec:
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: openclaw
+            policyTypes: [Ingress]
+            ingress:
+              - ports:
+                  - port: 8080
+                    protocol: TCP
+      register: _netpol_result
+      ignore_errors: true
+      when: state == 'present' and _sso | bool
+
+    - name: Warn if the NetworkPolicy could not be created
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️  Could not create NetworkPolicy openclaw-sso-ingress (insufficient
+          permissions?). Login still works — the gateway trusts identity only
+          from the in-pod proxy — but the gateway port stays reachable in-cluster.
+      when: state == 'present' and _sso | bool and _netpol_result is failed
+
+    - name: Remove Log in with OpenShift resources when using token auth
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.api }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+        namespace: "{{ openclaw_namespace }}"
+      loop:
+        - { api: networking.k8s.io/v1, kind: NetworkPolicy,  name: openclaw-sso-ingress }
+        - { api: v1,                   kind: Secret,         name: openclaw-proxy }
+        - { api: v1,                   kind: ServiceAccount, name: openclaw-proxy }
+      failed_when: false
+      when: state == 'present' and not (_sso | bool)
 
     # ── Deploy summary ─────────────────────────────────────────────────────────
     - name: Print deployment summary
@@ -716,8 +970,9 @@
           - ""
           - "{{ '⚠️  WhatsApp webhook: https://' + _route_host + '/webhook/whatsapp' if _whatsapp_enabled | bool else '' }}"
           - ""
-          - "Retrieve gateway token:"
-          - "  oc get secret openclaw-credentials -o jsonpath='{.data.OPENCLAW_GATEWAY_TOKEN}' | base64 -d && echo"
+          - "Auth        : {{ 'Log in with OpenShift (admins: ' ~ (_admin_users | join(', ')) ~ ')' if _sso | bool else 'gateway token + device pairing' }}"
+          - "{{ '' if _sso | bool else 'Retrieve gateway token:' }}"
+          - "{{ '' if _sso | bool else '  oc get secret openclaw-credentials -o jsonpath={.data.OPENCLAW_GATEWAY_TOKEN} | base64 -d && echo' }}"
           - ""
           - "Watch rollout:"
           - "  oc rollout status deployment/openclaw"
@@ -728,7 +983,7 @@
         oc get secret openclaw-credentials           -n {{ openclaw_namespace }}           -o jsonpath='{.data.OPENCLAW_GATEWAY_TOKEN}' | base64 -d
       register: _token_value
       changed_when: false
-      when: state == 'present'
+      when: (state == 'present') and not (_sso | bool)
 
     # On macOS, copy the gateway token straight to the clipboard with pbcopy
     # so the user can paste it into the Control UI without selecting it
@@ -741,6 +996,7 @@
       changed_when: false
       failed_when: false
       when:
+        - not (_sso | bool)
         - state == 'present'
         - ansible_system | default('') == 'Darwin'
 
@@ -752,15 +1008,42 @@
           - "  Gateway Token : {{ _token_value.stdout }}"
           - "  Direct URL    : https://{{ _route_host }}/?token={{ _token_value.stdout }}"
           - "======================================================"
-      when: state == 'present'
+      when: (state == 'present') and not (_sso | bool)
 
     - name: Confirm token copied to macOS clipboard
       ansible.builtin.debug:
         msg: "📋 Gateway token copied to clipboard — paste it into the Control UI with ⌘V"
       when:
+        - not (_sso | bool)
         - state == 'present'
         - ansible_system | default('') == 'Darwin'
         - _pbcopy_result.rc | default(1) == 0
+
+    - name: Wait for OpenClaw pod to be Ready (Log in with OpenShift)
+      ansible.builtin.command:
+        cmd: >
+          oc rollout status deployment/openclaw
+          -n {{ openclaw_namespace }}
+          --timeout=300s
+      changed_when: false
+      failed_when: false
+      when: state == 'present' and _sso | bool
+
+    - name: Print Log in with OpenShift instructions
+      ansible.builtin.debug:
+        msg:
+          - "======================================================"
+          - "  Open        : https://{{ _route_host }}"
+          - "  Sign in     : Log in with OpenShift — no token, no pairing"
+          - "  Admins      : {{ _admin_users | join(', ') }}"
+          - "  Who can in  : anyone passing {{ _oauth_sar }}"
+          - ""
+          - "  Invite a colleague:"
+          - "    oc adm policy add-role-to-user view <their-openshift-username> -n {{ openclaw_namespace }}"
+          - "  Remove access:"
+          - "    oc adm policy remove-role-from-user view <their-openshift-username> -n {{ openclaw_namespace }}"
+          - "======================================================"
+      when: state == 'present' and _sso | bool
 
     # -------------------------------------------------------------------------
     # Device pairing — automated first-browser approval
@@ -782,7 +1065,7 @@
           -n {{ openclaw_namespace }}
           --timeout=180s
       changed_when: false
-      when: state == 'present' and not (skip_pairing | default(false) | bool)
+      when: (state == 'present' and not (skip_pairing | default(false) | bool)) and not (_sso | bool)
 
     - name: Prompt user to open browser and connect
       ansible.builtin.pause:
@@ -795,7 +1078,7 @@
           Then press ENTER here. The playbook will auto-approve the pairing
           request for ~60 seconds — just click Connect again in the browser
           when it says the device was approved.
-      when: state == 'present' and not (skip_pairing | default(false) | bool)
+      when: (state == 'present' and not (skip_pairing | default(false) | bool)) and not (_sso | bool)
 
     # Continuous approve loop, run inside the pod. For up to ~60s it lists
     # pending requests and approves each UUID it finds. Exits early and cleanly
@@ -822,7 +1105,7 @@
       register: _pairing_loop
       changed_when: "'APPROVED' in _pairing_loop.stdout"
       failed_when: false
-      when: state == 'present' and not (skip_pairing | default(false) | bool)
+      when: (state == 'present' and not (skip_pairing | default(false) | bool)) and not (_sso | bool)
 
     - name: Print pairing result
       ansible.builtin.debug:
@@ -830,6 +1113,7 @@
           - "✅ Device pairing approved — click Connect again in the browser."
           - "This browser is now paired. Future logins from it go straight through."
       when:
+        - not (_sso | bool)
         - state == 'present'
         - not (skip_pairing | default(false) | bool)
         - _pairing_loop is defined
@@ -852,6 +1136,7 @@
           - "  3. Click Connect again in the browser."
           - "======================================================"
       when:
+        - not (_sso | bool)
         - state == 'present'
         - not (skip_pairing | default(false) | bool)
         - _pairing_loop is defined
