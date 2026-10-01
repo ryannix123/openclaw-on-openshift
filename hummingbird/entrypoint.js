@@ -56,15 +56,16 @@ mkdirSync(WORKSPACE_DIR, { recursive: true });
 if (!existsSync(INIT_FLAG)) {
   log("First run detected — bootstrapping config...");
 
-  const token = process.env.OPENCLAW_GATEWAY_TOKEN;
-  if (!token) {
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN || "";
+  const ssoMode = (process.env.OPENCLAW_AUTH_MODE || "token") === "trusted-proxy";
+  if (!token && !ssoMode) {
     die("OPENCLAW_GATEWAY_TOKEN is not set. Generate one and store it in your OpenShift Secret.");
   }
 
   if (!existsSync(ENV_FILE)) {
     writeFileSync(ENV_FILE, [
       "# OpenClaw runtime environment — written by entrypoint.js on first run",
-      `OPENCLAW_GATEWAY_TOKEN=${token}`,
+      ...(token ? [`OPENCLAW_GATEWAY_TOKEN=${token}`] : []),
       "OPENCLAW_DISABLE_BONJOUR=1",
       "NODE_ENV=production",
       "",
@@ -81,6 +82,17 @@ if (!existsSync(INIT_FLAG)) {
   log("First-run bootstrap complete.");
 } else {
   log("Config already initialized — skipping bootstrap.");
+}
+
+// Log in with OpenShift: OpenClaw refuses to start in trusted-proxy mode if a
+// shared token is configured anywhere — including the .env file on the PVC
+// written by an earlier token-mode deployment. Strip it on every start.
+if ((process.env.OPENCLAW_AUTH_MODE || "token") === "trusted-proxy" && existsSync(ENV_FILE)) {
+  const envText = readFileSync(ENV_FILE, "utf8");
+  if (/^OPENCLAW_GATEWAY_TOKEN=/m.test(envText)) {
+    writeFileSync(ENV_FILE, envText.split("\n").filter((l) => !l.startsWith("OPENCLAW_GATEWAY_TOKEN=")).join("\n"));
+    log(`Removed gateway token from ${ENV_FILE} (trusted-proxy mode).`);
+  }
 }
 
 // ---------------------------------------------------------------------------

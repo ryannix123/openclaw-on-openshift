@@ -43,8 +43,8 @@ mkdir -p "${CONFIG_DIR}" "${WORKSPACE_DIR}"
 if [[ ! -f "${INITIALIZED_FLAG}" ]]; then
     echo "[entrypoint] First run detected — bootstrapping config..."
 
-    # Require gateway token
-    if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+    # Require gateway token (not used in trusted-proxy / Log in with OpenShift mode)
+    if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" && "${OPENCLAW_AUTH_MODE:-token}" != "trusted-proxy" ]]; then
         echo "[entrypoint] ERROR: OPENCLAW_GATEWAY_TOKEN is not set." >&2
         echo "[entrypoint]        Generate one and store it in your OpenShift Secret." >&2
         exit 1
@@ -57,7 +57,7 @@ if [[ ! -f "${INITIALIZED_FLAG}" ]]; then
 # OpenClaw runtime environment — written by entrypoint.sh on first run
 # This file is persisted on the config PVC. Edit carefully.
 
-OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
 OPENCLAW_DISABLE_BONJOUR=1
 NODE_ENV=production
 EOF
@@ -81,6 +81,16 @@ EOF
     echo "[entrypoint] Bootstrap complete."
 else
     echo "[entrypoint] Config already initialized — skipping bootstrap."
+fi
+
+# Log in with OpenShift: OpenClaw refuses to start in trusted-proxy mode if a
+# shared token is configured ANYWHERE — including the .env file on the PVC
+# written by an earlier token-mode deployment. Strip it on every start.
+if [[ "${OPENCLAW_AUTH_MODE:-token}" == "trusted-proxy" && -f "${ENV_FILE}" ]]; then
+    if grep -q '^OPENCLAW_GATEWAY_TOKEN=' "${ENV_FILE}"; then
+        sed -i '/^OPENCLAW_GATEWAY_TOKEN=/d' "${ENV_FILE}"
+        echo "[entrypoint] Removed gateway token from ${ENV_FILE} (trusted-proxy mode)."
+    fi
 fi
 
 # ---------------------------------------------------------------------------

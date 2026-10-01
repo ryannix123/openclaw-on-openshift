@@ -812,7 +812,7 @@
               app.kubernetes.io/managed-by: ansible
               app.openshift.io/runtime: nodejs
             annotations:
-              deployment.kubernetes.io/force-restart: "{{ ansible_date_time.iso8601 if openclaw_force_restart else 'false' }}"
+              deployment.kubernetes.io/force-restart: "{{ ansible_facts['date_time']['iso8601'] if openclaw_force_restart else 'false' }}"
               # Custom icon in OpenShift Topology view (OCP 4.20+).
               # Falls back to app.openshift.io/runtime: nodejs on older versions.
               app.openshift.io/custom-icon: "https://raw.githubusercontent.com/ryannix123/openclaw-on-openshift/main/.github/openclaw.png"
