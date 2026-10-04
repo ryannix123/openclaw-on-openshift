@@ -419,6 +419,80 @@ See `skills/satellite-cv-promote/SKILL.md` for a working example.
 
 ---
 
+## MCP Servers
+
+Skills teach the agent *how* to do something; [MCP servers](https://docs.openclaw.ai/tools/mcp) give it *tools* from another service. OpenClaw's built-in MCP client connects to any Model Context Protocol server and the tools it exposes go through the same tool-policy controls as everything else. Declare servers in `vars/openclaw.yml`:
+
+```yaml
+openclaw_mcp_servers:
+  worldmonitor:
+    url: "http://worldmonitor:8080/api/mcp"
+    transport: streamable-http
+    header_name: X-WorldMonitor-Key
+    api_key: "{{ vault_worldmonitor_mcp_key }}"
+    tool_include: ["get_*", "list_*", "search_*"]
+```
+
+The playbook writes each entry to `mcp.servers` in `openclaw.json` and puts the API key in the `openclaw-credentials` Secret, where it reaches the pod as `OPENCLAW_MCP_KEY_<NAME>`. The header in config is the literal `${OPENCLAW_MCP_KEY_<NAME>}`, which OpenClaw resolves at runtime — the key never lands in a ConfigMap or on the config PVC. `tool_include` is an allowlist: tools the server adds later stay out of the agent's catalog until you opt in. Servers added by hand in the Control UI are left alone on re-runs.
+
+### Example — World Monitor, in the same namespace
+
+[World Monitor](https://github.com/ryannix123/worldmonitor-redhat) is a self-hosted global situational-awareness dashboard — conflicts, chokepoints, travel advisories, markets, infrastructure — that exposes ~86 read-only MCP tools. Deploy it alongside OpenClaw and the agent reaches it over the cluster-internal Service: no Route, no TLS, the MCP endpoint is never public.
+
+The key is World Monitor's own operator key — the `WORLDMONITOR_VALID_KEYS` value in its `worldmonitor-relay` Secret:
+
+```bash
+oc get secret worldmonitor-relay -o jsonpath='{.data.WORLDMONITOR_VALID_KEYS}' | base64 -d
+```
+
+Then redeploy OpenClaw and verify the server answers:
+
+```bash
+ansible-playbook openclaw-on-ocp.yml
+oc exec deploy/openclaw -c openclaw-gateway -- openclaw mcp doctor worldmonitor --probe
+```
+
+Ask the agent *"What is the chokepoint status at Hormuz, and which countries moved to 'reconsider travel' this week?"* and watch it call `get_chokepoint_status` and `get_country_risk` against the dashboard next door.
+
+> **Sandbox note.** The Developer Sandbox hibernates pods after 12 hours. If OpenClaw wakes before World Monitor, the MCP probe fails and backs off (30 s, doubling to 10 min). Once World Monitor is up, `openclaw mcp reload` clears the backoff immediately.
+
+---
+
+## Automations (scheduled reports and alerts)
+
+OpenClaw's scheduler ([`openclaw automations`](https://docs.openclaw.ai/cli/cron)) runs an isolated agent turn on a cron schedule and delivers the reply to a chat channel or a webhook. Declare jobs in `vars/openclaw.yml` and the playbook registers them through the CLI after the gateway is up — add if missing, edit if present. Jobs you create by hand are never touched; playbook-managed ones carry a `[managed]` marker and are pruned when you remove them from the var (`openclaw_automations_prune: false` to keep them).
+
+```yaml
+openclaw_automations:
+  wm-hourly-sitrep:
+    schedule: "25 * * * *"
+    tz: America/Chicago
+    prompt: "{{ lookup('file', 'prompts/wm-hourly-sitrep.txt') }}"
+    model: anthropic/claude-haiku-4-5
+    delivery:
+      channel: telegram
+      to: "-1001234567890"
+    timeout_seconds: 120
+```
+
+A reply that is exactly `NO_REPLY` is suppressed, so a job stays quiet when nothing happened — the prompt decides what "nothing" means. `delivery.webhook: "https://…"` posts the finished text to a URL instead of a chat; omit `delivery` for an internal job you read with `openclaw automations show`. Per-job `model` lets scheduled work run on a cheaper model than the interactive agent.
+
+### Example — hourly SITREP from World Monitor
+
+`prompts/wm-hourly-sitrep.txt` plus the `worldmonitor-sitrep` skill produce an hourly situation report: theater posture, chokepoints, advisory levels, focal points — **as a diff against the previous hour**, delivered only when something moved. The skill keeps the prior run's snapshot at `sitrep/last-snapshot.json` in the workspace, so "what changed" is computed, not guessed. Two scheduling notes: World Monitor's data only moves when its seeders run (hourly at `:17` on OpenShift), so the job runs at `:25`; and 24 Haiku runs a day with a handful of tool calls each costs well under a dollar a month.
+
+Enable the skill alongside the job:
+
+```yaml
+openclaw_custom_skills:
+  - name: worldmonitor-sitrep
+    skill_md: "{{ lookup('file', 'skills/worldmonitor-sitrep/SKILL.md') }}"
+```
+
+Because the `worldmonitor` MCP server is limited to `get_*` tools, the worst a scheduled run can do is write a wrong summary — which you can check against the dashboard in ten seconds. That is the right first job to hand an unattended agent.
+
+---
+
 ## CI/CD
 
 GitHub Actions builds and pushes both variants to [Quay.io](https://quay.io/repository/ryan_nix/openclaw-openshift) nightly via a matrix strategy. A version check against the upstream OpenClaw release skips the build if nothing changed.
