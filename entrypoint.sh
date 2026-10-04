@@ -238,6 +238,56 @@ if (internalUrl && internalModel) {
   console.log("[entrypoint] Primary model overridden to: internal-llm/" + internalModel);
 }
 
+// ---------------------------------------------------------------------------
+// MCP servers
+// OPENCLAW_MCP_SERVERS is a JSON object from Ansible (openclaw_mcp_servers):
+//   { name: { url, transport, headerName, keyEnv, toolInclude[],
+//             requestTimeoutMs, connectionTimeoutMs } }
+// Each entry becomes mcp.servers.<name> in openclaw.json. The API key is NOT
+// in the spec: keyEnv names an env var (OPENCLAW_MCP_KEY_<NAME>) delivered by
+// the openclaw-credentials Secret, and the header is written as the literal
+// "${OPENCLAW_MCP_KEY_<NAME>}" so OpenClaw resolves it at runtime — the key
+// never lands in openclaw.json on the PVC.
+// Servers managed here are tagged so re-runs can remove ones no longer
+// declared without touching servers added by hand in the Control UI.
+// ---------------------------------------------------------------------------
+let mcpSpec = {};
+try { mcpSpec = JSON.parse(process.env.OPENCLAW_MCP_SERVERS || "{}"); } catch (e) {
+  console.warn("[entrypoint] OPENCLAW_MCP_SERVERS is not valid JSON — ignoring: " + e.message);
+}
+cfg.mcp         = cfg.mcp         || {};
+cfg.mcp.servers = cfg.mcp.servers || {};
+for (const [name, s] of Object.entries(cfg.mcp.servers)) {
+  if (s && s._managedBy === "openclaw-on-openshift" && !mcpSpec[name]) {
+    delete cfg.mcp.servers[name];
+    console.log("[entrypoint] MCP server removed (no longer declared): " + name);
+  }
+}
+for (const [name, s] of Object.entries(mcpSpec)) {
+  if (!s || !s.url) continue;
+  const entry = {
+    _managedBy: "openclaw-on-openshift",
+    url: s.url,
+    transport: s.transport || "streamable-http",
+    enabled: true,
+    connectionTimeoutMs: s.connectionTimeoutMs || 5000,
+    requestTimeoutMs: s.requestTimeoutMs || 20000,
+  };
+  if (s.headerName && s.keyEnv) {
+    if (!process.env[s.keyEnv]) {
+      console.warn("[entrypoint] MCP server " + name + ": " + s.keyEnv + " is not set — the server will be configured but calls will fail auth");
+    }
+    entry.headers = { [s.headerName]: "${" + s.keyEnv + "}" };
+  }
+  if (Array.isArray(s.toolInclude) && s.toolInclude.length) {
+    entry.toolFilter = { include: s.toolInclude };
+  }
+  cfg.mcp.servers[name] = entry;
+  console.log("[entrypoint] MCP server configured: " + name + " -> " + s.url
+    + (entry.toolFilter ? " (tools: " + s.toolInclude.join(", ") + ")" : ""));
+}
+if (Object.keys(cfg.mcp.servers).length === 0) delete cfg.mcp;
+
 fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
 console.log("[entrypoint] openclaw.json written.");
 // Log the effective config with secrets redacted (gateway token, provider keys)

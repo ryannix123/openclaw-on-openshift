@@ -419,6 +419,45 @@ See `skills/satellite-cv-promote/SKILL.md` for a working example.
 
 ---
 
+## MCP Servers
+
+Skills teach the agent *how* to do something; [MCP servers](https://docs.openclaw.ai/tools/mcp) give it *tools* from another service. OpenClaw's built-in MCP client connects to any Model Context Protocol server and the tools it exposes go through the same tool-policy controls as everything else. Declare servers in `vars/openclaw.yml`:
+
+```yaml
+openclaw_mcp_servers:
+  worldmonitor:
+    url: "http://worldmonitor:8080/api/mcp"
+    transport: streamable-http
+    header_name: X-WorldMonitor-Key
+    api_key: "{{ vault_worldmonitor_mcp_key }}"
+    tool_include: ["get_*", "list_*", "search_*"]
+```
+
+The playbook writes each entry to `mcp.servers` in `openclaw.json` and puts the API key in the `openclaw-credentials` Secret, where it reaches the pod as `OPENCLAW_MCP_KEY_<NAME>`. The header in config is the literal `${OPENCLAW_MCP_KEY_<NAME>}`, which OpenClaw resolves at runtime — the key never lands in a ConfigMap or on the config PVC. `tool_include` is an allowlist: tools the server adds later stay out of the agent's catalog until you opt in. Servers added by hand in the Control UI are left alone on re-runs.
+
+### Example — World Monitor, in the same namespace
+
+[World Monitor](https://github.com/ryannix123/worldmonitor-redhat) is a self-hosted global situational-awareness dashboard — conflicts, chokepoints, travel advisories, markets, infrastructure — that exposes ~86 read-only MCP tools. Deploy it alongside OpenClaw and the agent reaches it over the cluster-internal Service: no Route, no TLS, the MCP endpoint is never public.
+
+The key is World Monitor's own operator key — the `WORLDMONITOR_VALID_KEYS` value in its `worldmonitor-relay` Secret:
+
+```bash
+oc get secret worldmonitor-relay -o jsonpath='{.data.WORLDMONITOR_VALID_KEYS}' | base64 -d
+```
+
+Then redeploy OpenClaw and verify the server answers:
+
+```bash
+ansible-playbook openclaw-on-ocp.yml
+oc exec deploy/openclaw -c openclaw-gateway -- openclaw mcp doctor worldmonitor --probe
+```
+
+Ask the agent *"What is the chokepoint status at Hormuz, and which countries moved to 'reconsider travel' this week?"* and watch it call `get_chokepoint_status` and `get_country_risk` against the dashboard next door.
+
+> **Sandbox note.** The Developer Sandbox hibernates pods after 12 hours. If OpenClaw wakes before World Monitor, the MCP probe fails and backs off (30 s, doubling to 10 min). Once World Monitor is up, `openclaw mcp reload` clears the backoff immediately.
+
+---
+
 ## CI/CD
 
 GitHub Actions builds and pushes both variants to [Quay.io](https://quay.io/repository/ryan_nix/openclaw-openshift) nightly via a matrix strategy. A version check against the upstream OpenClaw release skips the build if nothing changed.

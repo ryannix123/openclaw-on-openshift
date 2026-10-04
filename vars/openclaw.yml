@@ -274,6 +274,34 @@ openclaw_channels:
 # ---------------------------------------------------------------------------
 
 openclaw_custom_skills: []
+
+# ---------------------------------------------------------------------------
+# MCP servers — give the agent tools from other services
+# ---------------------------------------------------------------------------
+# OpenClaw's built-in MCP client (Settings → MCP, or `mcp.servers` in config)
+# can borrow tools from any Model Context Protocol server. Each entry here is
+# written into openclaw.json by the entrypoint; the API key, if any, goes into
+# the openclaw-credentials Secret and is referenced from config by env var, so
+# it never lands in a ConfigMap or a config literal.
+#
+# Example — World Monitor (github.com/ryannix123/worldmonitor-redhat), a
+# self-hosted global situational-awareness dashboard that exposes ~86 read-only
+# tools (country briefs, conflict events, chokepoints, advisories, markets…).
+# Deployed in the SAME namespace it is reachable over the cluster-internal
+# Service, so no Route or TLS is involved and the endpoint is never public:
+#
+#   openclaw_mcp_servers:
+#     worldmonitor:
+#       url: "http://worldmonitor:8080/api/mcp"
+#       transport: streamable-http          # streamable-http | sse
+#       header_name: X-WorldMonitor-Key     # auth header the server expects
+#       api_key: "{{ vault_worldmonitor_mcp_key }}"   # its WORLDMONITOR_VALID_KEYS value
+#       tool_include: ["get_*", "list_*", "search_*"] # read-only surface only
+#       request_timeout_ms: 20000
+#
+# tool_include is an allowlist: tools the server adds later (including any
+# that write) stay out of the agent's catalog until you add them here.
+openclaw_mcp_servers: {}
   # Example — Red Hat Satellite content view promotion skill:
   # - name: satellite-cv-promote
   #   skill_md: |

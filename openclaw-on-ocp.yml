@@ -174,6 +174,20 @@
       when: state == 'present' and _whatsapp_enabled | bool
 
     # ── Delete-only guard ──────────────────────────────────────────────────────
+    - name: Validate MCP server definitions
+      ansible.builtin.assert:
+        that:
+          - item.value.url | default('') | length > 0
+          - (item.value.transport | default('streamable-http')) in ['streamable-http', 'sse']
+          - item.key is match('^[a-z][a-z0-9_-]*$')
+        fail_msg: >-
+          openclaw_mcp_servers.{{ item.key }} needs a url, a transport of
+          streamable-http or sse, and a lowercase name (letters, digits, - or _)
+      loop: "{{ openclaw_mcp_servers | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: state == 'present'
+
     - name: Confirm PVC deletion
       ansible.builtin.pause:
         prompt: >
@@ -361,6 +375,36 @@
       when: state == 'present'
 
     # ── "Log in with OpenShift" prep ───────────────────────────────────────────
+    # ── MCP servers ────────────────────────────────────────────────────────────
+    # Two outputs from openclaw_mcp_servers:
+    #   _mcp_secret_data — {OPENCLAW_MCP_KEY_<NAME>: api_key} for servers that
+    #                      have one; merged into the credentials Secret so the
+    #                      key reaches the pod as an env var only.
+    #   _mcp_spec_json   — everything else, as JSON in OPENCLAW_MCP_SERVERS; the
+    #                      entrypoint writes it to mcp.servers in openclaw.json
+    #                      and references the key as ${OPENCLAW_MCP_KEY_<NAME>}.
+    - name: Build MCP server secret data and spec
+      ansible.builtin.set_fact:
+        _mcp_secret_data: >-
+          {{ _mcp_secret_data | default({}) | combine(
+               {('OPENCLAW_MCP_KEY_' ~ (item.key | upper | regex_replace('[^A-Z0-9]', '_'))): item.value.api_key}
+               if (item.value.api_key | default('') | length > 0) else {}) }}
+        _mcp_spec: >-
+          {{ _mcp_spec | default({}) | combine({item.key: {
+               'url': item.value.url,
+               'transport': item.value.transport | default('streamable-http'),
+               'headerName': item.value.header_name | default(''),
+               'keyEnv': ('OPENCLAW_MCP_KEY_' ~ (item.key | upper | regex_replace('[^A-Z0-9]', '_')))
+                         if (item.value.api_key | default('') | length > 0) else '',
+               'toolInclude': item.value.tool_include | default([]),
+               'requestTimeoutMs': item.value.request_timeout_ms | default(20000),
+               'connectionTimeoutMs': item.value.connection_timeout_ms | default(5000)
+             }}) }}
+      loop: "{{ openclaw_mcp_servers | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: state == 'present'
+
     - name: Identify the user running the playbook (default OpenClaw admin)
       ansible.builtin.command: oc whoami
       register: _oc_whoami
@@ -475,6 +519,7 @@
                 if _sso | bool else {"OPENCLAW_GATEWAY_TOKEN": _gateway_token})
               | combine({_api_key_env_var: ai_api_key})
               | combine(_channel_secret_data)
+              | combine(_mcp_secret_data | default({}))
               | combine(
                   {"OPENCLAW_OPENAI_API_KEY": openai_api_key}
                   if (openai_api_key | default("") | length > 0)
@@ -695,6 +740,10 @@
               value: "{{ openai_base_url | default('') }}"
             - name: OPENCLAW_OPENAI_MODEL
               value: "{{ openai_model | default('') }}"
+            # MCP servers (non-secret spec; keys arrive via the credentials
+            # Secret as OPENCLAW_MCP_KEY_<NAME>) — see entrypoint.sh
+            - name: OPENCLAW_MCP_SERVERS
+              value: "{{ _mcp_spec | default({}) | to_json }}"
             # Authentication mode — see "Log in with OpenShift" in README
             - name: OPENCLAW_AUTH_MODE
               value: "{{ 'trusted-proxy' if _sso else 'token' }}"
