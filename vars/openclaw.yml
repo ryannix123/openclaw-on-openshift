@@ -302,6 +302,43 @@ openclaw_custom_skills: []
 # tool_include is an allowlist: tools the server adds later (including any
 # that write) stay out of the agent's catalog until you add them here.
 openclaw_mcp_servers: {}
+
+# ---------------------------------------------------------------------------
+# Automations — scheduled agent jobs (reports, alerts)
+# ---------------------------------------------------------------------------
+# OpenClaw's scheduler (`openclaw automations`) runs an isolated agent turn on
+# a cron schedule and delivers the reply to a chat channel or a webhook. Jobs
+# live in OpenClaw's own state database, so the playbook registers them
+# through the CLI after the gateway is up (add if missing, edit if present —
+# jobs you create by hand are left alone; see openclaw_automations_prune).
+#
+# A reply that is exactly NO_REPLY is suppressed, which is how a job stays
+# quiet when nothing happened: tell it to answer NO_REPLY in the prompt.
+#
+# Example — hourly SITREP from World Monitor, delivered to Telegram, quiet
+# when nothing changed. Runs a few minutes after World Monitor's seeder
+# CronJob (:17) so it reads fresh data. The worldmonitor-sitrep skill keeps
+# the prior run's snapshot in the workspace so "what changed" is a real diff.
+#
+#   openclaw_automations:
+#     wm-hourly-sitrep:
+#       schedule: "25 * * * *"
+#       tz: America/Chicago
+#       prompt: "{{ lookup('file', 'prompts/wm-hourly-sitrep.txt') }}"
+#       model: anthropic/claude-haiku-4-5     # cheap; the interactive agent keeps Sonnet
+#       delivery:
+#         channel: telegram
+#         to: "-1001234567890"
+#       timeout_seconds: 120
+#
+# delivery.webhook: "https://…" posts the finished text to a URL instead
+# (do not combine with channel/to). Omit delivery entirely for an internal
+# job whose output you read with `openclaw automations show`.
+openclaw_automations: {}
+
+# Remove playbook-managed automations that are no longer declared above.
+# Jobs created by hand (not named here) are never touched.
+openclaw_automations_prune: true
   # Example — Red Hat Satellite content view promotion skill:
   # - name: satellite-cv-promote
   #   skill_md: |

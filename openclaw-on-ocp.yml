@@ -188,6 +188,22 @@
         label: "{{ item.key }}"
       when: state == 'present'
 
+    - name: Validate automation definitions
+      ansible.builtin.assert:
+        that:
+          - item.value.schedule | default('') | length > 0
+          - item.value.prompt | default('') | length > 0
+          - item.key is match('^[a-z][a-z0-9_-]*$')
+          - not ((item.value.delivery.webhook | default('') | length > 0)
+                 and (item.value.delivery.channel | default('') | length > 0))
+        fail_msg: >-
+          openclaw_automations.{{ item.key }} needs a schedule and a prompt, a
+          lowercase name, and either delivery.webhook or delivery.channel/to (not both)
+      loop: "{{ openclaw_automations | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: state == 'present'
+
     - name: Confirm PVC deletion
       ansible.builtin.pause:
         prompt: >
@@ -1158,6 +1174,71 @@
       changed_when: "'APPROVED' in _pairing_loop.stdout"
       failed_when: false
       when: (state == 'present' and not (skip_pairing | default(false) | bool)) and not (_sso | bool)
+
+    # ── Automations ────────────────────────────────────────────────────────────
+    # Jobs live in OpenClaw's state database, not openclaw.json, so they are
+    # registered through the CLI against the running gateway. The spec is passed
+    # as JSON on stdin and a small in-pod script does add-or-edit by name, then
+    # (optionally) removes playbook-managed jobs no longer declared. Managed jobs
+    # are recognisable by the "[managed]" marker in their display name.
+    - name: Wait for the gateway to accept CLI connections
+      ansible.builtin.shell: |
+        oc exec -n {{ openclaw_namespace }} deploy/openclaw -- sh -c '
+          for i in $(seq 1 30); do
+            node dist/index.js automations list >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "gateway not ready for CLI after 60s" >&2; exit 1'
+      changed_when: false
+      when: state == 'present' and (openclaw_automations | default({}) | length > 0)
+
+    - name: Register automations (add or edit by name; prune undeclared managed jobs)
+      ansible.builtin.shell: |
+        oc exec -n {{ openclaw_namespace }} -i deploy/openclaw -- node - <<'JS'
+        const { execFileSync } = require("child_process");
+        const spec  = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        const prune = {{ openclaw_automations_prune | default(true) | bool | to_json }};
+        const cli   = (...a) => execFileSync("node", ["dist/index.js", "automations", ...a], { encoding: "utf8" });
+        // `automations list --json` returns { jobs: [...] } (cron-cli/list-jobs.ts).
+        let existing = [];
+        try { const r = JSON.parse(cli("list", "--all", "--json")); existing = Array.isArray(r) ? r : (r.jobs || []); } catch (e) { existing = []; }
+        const byName = Object.fromEntries(existing.map(j => [j.name, j]));
+        const MARK = "[managed]";
+        for (const [name, j] of Object.entries(spec)) {
+          const args = ["--name", name, "--display-name", `${name} ${MARK}`, "--cron", j.schedule];
+          if (j.tz) args.push("--tz", j.tz);
+          if (j.model) args.push("--model", j.model);
+          if (j.timeout_seconds != null) args.push("--timeout-seconds", String(j.timeout_seconds));
+          const d = j.delivery || {};
+          if (d.webhook) args.push("--webhook", d.webhook);
+          else if (d.channel) { args.push("--announce", "--channel", d.channel); if (d.to) args.push("--to", String(d.to)); }
+          else args.push("--no-deliver");
+          if (byName[name]) {
+            cli("edit", byName[name].id, ...args, "--message", j.prompt);
+            console.log("EDITED " + name);
+          } else {
+            cli("add", ...args, "--message", j.prompt);
+            console.log("ADDED " + name);
+          }
+        }
+        if (prune) for (const j of existing) {
+          const label = j.displayName || j.display_name || "";
+          if (label.endsWith(MARK) && !spec[j.name]) {
+            cli("remove", j.id);
+            console.log("REMOVED " + j.name);
+          }
+        }
+        JS
+      args:
+        stdin: "{{ openclaw_automations | default({}) | to_json }}"
+      register: _automations
+      changed_when: "'ADDED' in _automations.stdout or 'EDITED' in _automations.stdout or 'REMOVED' in _automations.stdout"
+      when: state == 'present' and (openclaw_automations | default({}) | length > 0)
+
+    - name: Show registered automations
+      ansible.builtin.debug:
+        msg: "{{ _automations.stdout_lines }}"
+      when: _automations is defined and _automations.stdout_lines is defined
 
     - name: Print pairing result
       ansible.builtin.debug:

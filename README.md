@@ -458,6 +458,41 @@ Ask the agent *"What is the chokepoint status at Hormuz, and which countries mov
 
 ---
 
+## Automations (scheduled reports and alerts)
+
+OpenClaw's scheduler ([`openclaw automations`](https://docs.openclaw.ai/cli/cron)) runs an isolated agent turn on a cron schedule and delivers the reply to a chat channel or a webhook. Declare jobs in `vars/openclaw.yml` and the playbook registers them through the CLI after the gateway is up — add if missing, edit if present. Jobs you create by hand are never touched; playbook-managed ones carry a `[managed]` marker and are pruned when you remove them from the var (`openclaw_automations_prune: false` to keep them).
+
+```yaml
+openclaw_automations:
+  wm-hourly-sitrep:
+    schedule: "25 * * * *"
+    tz: America/Chicago
+    prompt: "{{ lookup('file', 'prompts/wm-hourly-sitrep.txt') }}"
+    model: anthropic/claude-haiku-4-5
+    delivery:
+      channel: telegram
+      to: "-1001234567890"
+    timeout_seconds: 120
+```
+
+A reply that is exactly `NO_REPLY` is suppressed, so a job stays quiet when nothing happened — the prompt decides what "nothing" means. `delivery.webhook: "https://…"` posts the finished text to a URL instead of a chat; omit `delivery` for an internal job you read with `openclaw automations show`. Per-job `model` lets scheduled work run on a cheaper model than the interactive agent.
+
+### Example — hourly SITREP from World Monitor
+
+`prompts/wm-hourly-sitrep.txt` plus the `worldmonitor-sitrep` skill produce an hourly situation report: theater posture, chokepoints, advisory levels, focal points — **as a diff against the previous hour**, delivered only when something moved. The skill keeps the prior run's snapshot at `sitrep/last-snapshot.json` in the workspace, so "what changed" is computed, not guessed. Two scheduling notes: World Monitor's data only moves when its seeders run (hourly at `:17` on OpenShift), so the job runs at `:25`; and 24 Haiku runs a day with a handful of tool calls each costs well under a dollar a month.
+
+Enable the skill alongside the job:
+
+```yaml
+openclaw_custom_skills:
+  - name: worldmonitor-sitrep
+    skill_md: "{{ lookup('file', 'skills/worldmonitor-sitrep/SKILL.md') }}"
+```
+
+Because the `worldmonitor` MCP server is limited to `get_*` tools, the worst a scheduled run can do is write a wrong summary — which you can check against the dashboard in ten seconds. That is the right first job to hand an unattended agent.
+
+---
+
 ## CI/CD
 
 GitHub Actions builds and pushes both variants to [Quay.io](https://quay.io/repository/ryan_nix/openclaw-openshift) nightly via a matrix strategy. A version check against the upstream OpenClaw release skips the build if nothing changed.
