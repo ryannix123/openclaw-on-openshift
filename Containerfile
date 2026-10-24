@@ -59,7 +59,7 @@ RUN dnf install -y \
 # This build statically bundles SQLite 3.53.4 (WAL-reset-safe), unlike
 # Red Hat's nodejs-24 which links the unsafe system libsqlite3.
 # Pinned to a specific version for reproducible builds; bump deliberately.
-ARG NODE_VERSION=24.20.0
+ARG NODE_VERSION=24.22.1
 RUN set -eux; \
     arch="$(uname -m)"; \
     case "$arch" in \
@@ -222,7 +222,7 @@ USER root
 # it for some workspace operations; shadow-utils for user management;
 # procps-ng for `ps`, which OpenClaw 2.x's process-tree cleanup and
 # workspace-quiescence probes require (upstream's image ships procps too).
-ARG NODE_VERSION=24.20.0
+ARG NODE_VERSION=24.22.1
 RUN dnf install -y tar xz git shadow-utils procps-ng && \
     dnf clean all && rm -rf /var/cache/dnf && \
     set -eux; \
