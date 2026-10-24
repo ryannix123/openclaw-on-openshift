@@ -59,7 +59,7 @@ RUN dnf install -y git python3 make gcc gcc-c++ tar xz findutils procps-ng && \
     dnf clean all && rm -rf /var/cache/dnf
 
 # Official Node.js 24 (bundled safe SQLite 3.53.4).
-ARG NODE_VERSION=24.20.0
+ARG NODE_VERSION=24.22.1
 RUN set -eux; \
     arch="$(uname -m)"; \
     case "$arch" in \
