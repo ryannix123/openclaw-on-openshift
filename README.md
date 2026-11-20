@@ -505,8 +505,10 @@ GitHub Actions builds and pushes both variants to [Quay.io](https://quay.io/repo
 |---|---|---|
 | Latest stable | `:latest` | `:hummingbird-latest` |
 | Dated build | `:YYYY.MM.DD` | `:hummingbird-YYYY.MM.DD` |
-| Immutable git SHA | `:git-<sha>` | `:hummingbird-git-<sha>` |
+| Git SHA of this repo | `:git-<sha>` | `:hummingbird-git-<sha>` |
 | Tracks upstream | `:openclaw-<version>` | `:hummingbird-openclaw-<version>` |
+
+**Retention:** the per-build tags (`:YYYY.MM.DD`, `:git-<sha>`) carry `quay.expires-after=30d` and expire on Quay 30 days after they're pushed, then are garbage-collected 14 days after that. `:latest` and `:openclaw-<version>` never expire. A label is part of the image, so the workflow commits a labeled copy of each build (same layers, config-only change) and points only the per-build tags at it; otherwise `:latest` would inherit the expiry and disappear if the nightly build ever failed for 30 days. The TTL is `QUAY_TAG_TTL` in `build.yml`. A `:git-<sha>` tag gets a fresh 30 days every night that commit is rebuilt, so it expires 30 days after the repo moves on.
 
 ### Software Bill of Materials (SBOM)
 
