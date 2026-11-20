@@ -27,6 +27,11 @@
 #                           same repo SHA maps to many digests over time. Use
 #                           the digest for a truly pinned reference.
 #   :openclaw-<version>   — tagged with upstream OpenClaw release when known
+#
+# Tag retention:
+#   :YYYY.MM.DD and :git-<sha> expire on Quay after QUAY_TAG_TTL (30 days).
+#   :latest and :openclaw-<version> never expire. See the "Mark per-build tags
+#   to expire" step for how the two sets end up on different manifests.
 # =============================================================================
 
 name: Build & Push
@@ -70,6 +75,12 @@ env:
   IMAGE_NAME: openclaw-openshift
   # Full image path used in multiple steps
   IMAGE_REF:  quay.io/ryan_nix/openclaw-openshift
+  # How long the per-build tags (:YYYY.MM.DD, :git-<sha>) live on Quay. Quay
+  # reads `quay.expires-after` from an image's LABELS at push time and sets
+  # that tag to expire. Every nightly used to leave two tags per variant behind
+  # forever. Expired tags sit in Quay's time machine (14 days) before garbage
+  # collection, so a mistake is recoverable.
+  QUAY_TAG_TTL: 30d
 
 # ---------------------------------------------------------------------------
 # Prevent redundant runs: if a new push arrives while a run is in progress
@@ -236,6 +247,10 @@ jobs:
             [[ "${PUSH_OC_VERSION}"  == "true" ]] && echo "${BASE}:${PREFIX}openclaw-${OC_VERSION}"
             echo "EOF"
             echo "short_sha=${SHORT_SHA}"
+            echo "date_tag=${BASE}:${PREFIX}${DATE}"
+            echo "git_tag=${BASE}:${PREFIX}git-${SHORT_SHA}"
+            echo "latest_tag=${BASE}:${PREFIX}latest"
+            echo "push_latest=${PUSH_LATEST}"
             echo "date=${DATE}"
             echo "oc_version=${OC_VERSION}"
             echo "oc_ref=${OC_REF}"
@@ -295,6 +310,51 @@ jobs:
             maintainer=Ryan Nix <ryan.nix@gmail.com>
             io.openshift.expose-services=18789:http
             io.openshift.tags=ai,agent,nodejs,ubi10
+
+      # -----------------------------------------------------------------------
+      # Mark the per-build tags (:YYYY.MM.DD, :git-<sha>) to expire on Quay.
+      #
+      # Quay sets a tag's expiry from the `quay.expires-after` LABEL of the
+      # image pushed to it. A label is part of the image, so it can't go on the
+      # build above: every tag there points at one image, and :latest would
+      # inherit the expiry. If the nightly then failed for 30 days straight
+      # (it has broken for days before), :latest would vanish from Quay.
+      #
+      # Instead, commit a copy of the built image with only the label added
+      # and move the two per-build tags onto it. It's a config-only change: no
+      # rebuild, and the copy shares every layer with the unlabeled image (plus
+      # one empty layer from the commit), so Quay stores almost nothing extra. :latest and :openclaw-<version>
+      # stay on the unlabeled image and never expire.
+      # -----------------------------------------------------------------------
+      - name: Mark per-build tags to expire on Quay
+        if: github.event_name != 'pull_request'
+        env:
+          TTL:         ${{ env.QUAY_TAG_TTL }}
+          DATE_TAG:    ${{ steps.meta.outputs.date_tag }}
+          GIT_TAG:     ${{ steps.meta.outputs.git_tag }}
+          LATEST_TAG:  ${{ steps.meta.outputs.latest_tag }}
+          PUSH_LATEST: ${{ steps.meta.outputs.push_latest }}
+        run: |
+          set -euo pipefail
+          ctr=$(buildah from --pull=never "${DATE_TAG}")
+          buildah config --label "quay.expires-after=${TTL}" "${ctr}"
+          buildah commit --quiet --format docker "${ctr}" "${DATE_TAG}" >/dev/null
+          buildah rm "${ctr}" >/dev/null
+          buildah tag "${DATE_TAG}" "${GIT_TAG}"
+
+          # Fail the run rather than push a wrong expiry: the per-build tags
+          # must carry the label, and :latest must not.
+          label() { buildah inspect --type image \
+            --format '{{ index .OCIv1.Config.Labels "quay.expires-after" }}' "$1"; }
+          for T in "${DATE_TAG}" "${GIT_TAG}"; do
+            [[ "$(label "$T")" == "${TTL}" ]] || { echo "::error::$T is missing quay.expires-after"; exit 1; }
+            echo "$T → expires after ${TTL}"
+          done
+          if [[ "${PUSH_LATEST}" == "true" ]]; then
+            L=$(label "${LATEST_TAG}")
+            [[ -z "$L" || "$L" == "<no value>" ]] || { echo "::error::${LATEST_TAG} would expire"; exit 1; }
+            echo "${LATEST_TAG} → never expires"
+          fi
 
       # -----------------------------------------------------------------------
       # Push — only on non-PR runs (main branch pushes and scheduled builds).
