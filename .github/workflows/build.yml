@@ -29,7 +29,7 @@
 #   :openclaw-<version>   — tagged with upstream OpenClaw release when known
 #
 # Tag retention:
-#   :YYYY.MM.DD and :git-<sha> expire on Quay after QUAY_TAG_TTL (30 days).
+#   :YYYY.MM.DD and :git-<sha> expire on Quay after QUAY_TAG_TTL (14 days).
 #   :latest and :openclaw-<version> never expire. See the "Mark per-build tags
 #   to expire" step for how the two sets end up on different manifests.
 # =============================================================================
@@ -80,7 +80,7 @@ env:
   # that tag to expire. Every nightly used to leave two tags per variant behind
   # forever. Expired tags sit in Quay's time machine (14 days) before garbage
   # collection, so a mistake is recoverable.
-  QUAY_TAG_TTL: 30d
+  QUAY_TAG_TTL: 2w
 
 # ---------------------------------------------------------------------------
 # Prevent redundant runs: if a new push arrives while a run is in progress
@@ -317,7 +317,7 @@ jobs:
       # Quay sets a tag's expiry from the `quay.expires-after` LABEL of the
       # image pushed to it. A label is part of the image, so it can't go on the
       # build above: every tag there points at one image, and :latest would
-      # inherit the expiry. If the nightly then failed for 30 days straight
+      # inherit the expiry. If the nightly then failed for two weeks straight
       # (it has broken for days before), :latest would vanish from Quay.
       #
       # Instead, commit a copy of the built image with only the label added
